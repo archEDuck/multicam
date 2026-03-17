@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:archive/archive_io.dart';
@@ -42,11 +43,15 @@ class _MultiCamPageState extends State<MultiCamPage> {
   static const EventChannel _fotSensorChannel = EventChannel(
     'multicam/fot_sensor',
   );
+  static const MethodChannel _systemStatsChannel = MethodChannel(
+    'multicam/system_stats',
+  );
 
   StreamSubscription<dynamic>? _fotSubscription;
   StreamSubscription<UserAccelerometerEvent>? _accSubscription;
   StreamSubscription<GyroscopeEvent>? _gyroSubscription;
   Timer? _captureTimer;
+  Timer? _statsTimer;
 
   bool _isReady = false;
   bool _isRecording = false;
@@ -59,7 +64,8 @@ class _MultiCamPageState extends State<MultiCamPage> {
   int _frameIndex = 0;
   int _captureIntervalMs = 700;
   final TextEditingController _ipController = TextEditingController(
-    text: '192.168.1.',
+    text:
+        '127.0.0.1', // USB uzerinden adb reverse kullanilacak (veya 10.0.2.2 emulator icin)
   );
 
   double? _accX;
@@ -80,6 +86,18 @@ class _MultiCamPageState extends State<MultiCamPage> {
   int _cam1FrameKey = 0;
   int _cam2FrameKey = 0;
 
+  // System stats
+  double _cpuPercent = 0;
+  double _totalRamMB = 0;
+  double _usedRamMB = 0;
+  double _appHeapMB = 0;
+  double _appNativeMB = 0;
+
+  // FPS tracking
+  DateTime? _lastCaptureTime;
+  double _actualFps = 0;
+  final List<double> _fpsHistory = [];
+
   @override
   void initState() {
     super.initState();
@@ -89,6 +107,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
   @override
   void dispose() {
     _captureTimer?.cancel();
+    _statsTimer?.cancel();
     _fotSubscription?.cancel();
     _accSubscription?.cancel();
     _gyroSubscription?.cancel();
@@ -107,10 +126,21 @@ class _MultiCamPageState extends State<MultiCamPage> {
         return;
       }
 
+      // Storage permissions
+      if (Platform.isAndroid) {
+        if (await Permission.manageExternalStorage.isDenied) {
+          await Permission.manageExternalStorage.request();
+        }
+        if (await Permission.storage.isDenied) {
+          await Permission.storage.request();
+        }
+      }
+
       await _initDualCameras();
 
       _startFotStream();
       _startImuStreams();
+      _startStatsPolling();
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -261,11 +291,19 @@ class _MultiCamPageState extends State<MultiCamPage> {
 
       setState(() {
         _isRecording = false;
-        _status = 'Kayit durduruldu. ZIP olusturuluyor...';
+        _status = 'Kayit durduruldu. Dosyalar isleniyor (Lutfen bekleyin)...';
       });
 
       if (sessionDir != null) {
         try {
+          // Cekim bittikten sonra arkadaki disk islem sureci icin 4 saniye bekleme
+          await Future.delayed(const Duration(seconds: 4));
+
+          if (!mounted) return;
+          setState(() {
+            _status = 'Dosyalar hazirlandi. ZIP olusturuluyor...';
+          });
+
           final zipPath = await _zipSessionDirectory(sessionDir);
           if (!mounted) return;
           setState(() {
@@ -331,22 +369,48 @@ class _MultiCamPageState extends State<MultiCamPage> {
 
     try {
       final file = File(zipPath);
+      if (!file.existsSync()) {
+        setState(() {
+          _status = 'Hata: ZIP dosyasi bulunamadi: $zipPath';
+        });
+        return;
+      }
+
       final fileName = file.uri.pathSegments.last;
+      final length = await file.length();
+      if (length == 0) {
+        setState(() {
+          _status = 'Hata: Olusturulan ZIP dosyasi bos (0 byte)!';
+        });
+        return;
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _status =
+            'ZIP gonderiliyor... ($fileName, ${(length / 1024).toStringAsFixed(0)} KB)';
+      });
 
       final client = HttpClient();
-      client.connectionTimeout = const Duration(seconds: 15);
+      client.connectionTimeout = const Duration(seconds: 45);
       final url = Uri.parse('http://$ip:5000/upload?file=$fileName');
       final request = await client.postUrl(url);
       request.headers.set(HttpHeaders.contentTypeHeader, 'application/zip');
-      request.contentLength = await file.length();
+      request.headers.set(HttpHeaders.contentLengthHeader, length.toString());
+      request.contentLength = length;
 
+      // BUYUK DOSYALARIN CÖKMEMESI VE SORUNSUZ İLETİLMESİ İÇİN STREAM KULLANILDI:
       await request.addStream(file.openRead());
+
       final response = await request.close();
 
       if (!mounted) return;
       if (response.statusCode == 200) {
+        final respBody = await response.transform(utf8.decoder).join();
+        print('DEBUG: Server response: $respBody');
         setState(() {
-          _status = 'ZIP Bilgisayara BASARIYLA GONDERILDI! ($fileName)';
+          _status =
+              'ZIP Bilgisayara BASARIYLA GONDERILDI! ($fileName, ${(length / 1024).toStringAsFixed(0)} KB)';
         });
       } else {
         setState(() {
@@ -362,23 +426,89 @@ class _MultiCamPageState extends State<MultiCamPage> {
   }
 
   Future<String> _zipSessionDirectory(Directory sessionDir) async {
-    final zipPath = '${sessionDir.path}.zip';
-    final encoder = ZipFileEncoder();
-    encoder.create(zipPath);
+    print('DEBUG: Checking session directory: ${sessionDir.path}');
+    if (!sessionDir.existsSync()) {
+      print('DEBUG: HATA! Session directory does not exist!');
+      throw Exception('Session directory does not exist: ${sessionDir.path}');
+    }
 
+    // Tüm devam eden çekimlerin bitmesini beklemek ve
+    // dosyalarin diske yazilmasi icin kisa bir bekleme süresi koyalim:
+    int waitCounter = 0;
+    while (_isCapturing && waitCounter < 30) {
+      await Future.delayed(const Duration(milliseconds: 100));
+      waitCounter++;
+    }
+    await Future.delayed(const Duration(seconds: 3));
+
+    // Dizindeki dosyalari say ve listele
+    final allFiles = <File>[];
     await for (final entity in sessionDir.list(
       recursive: true,
       followLinks: false,
     )) {
       if (entity is File) {
-        final relativePath = entity.path
-            .substring(sessionDir.path.length + 1)
-            .replaceAll(Platform.pathSeparator, '/');
-        encoder.addFile(entity, relativePath);
+        allFiles.add(entity);
       }
     }
 
-    encoder.close();
+    print('ZIP: ${allFiles.length} dosya bulundu, session: ${sessionDir.path}');
+    for (final f in allFiles) {
+      final size = f.lengthSync();
+      print('  -> ${f.path} ($size bytes)');
+    }
+
+    if (allFiles.isEmpty) {
+      throw Exception(
+        'Oturum klasoru bos — hic dosya bulunamadi: ${sessionDir.path}',
+      );
+    }
+
+    if (!mounted) return '';
+    setState(() {
+      _status = '${allFiles.length} dosya bulundu, ZIP olusturuluyor...';
+    });
+
+    final zipPath = '${sessionDir.path}.zip';
+    final encoder = ZipFileEncoder();
+
+    try {
+      encoder.create(zipPath);
+
+      for (final file in allFiles) {
+        if (!file.existsSync()) continue;
+        final relativePath = file.path
+            .substring(sessionDir.path.length + 1)
+            .replaceAll(Platform.pathSeparator, '/');
+        encoder.addFile(file, relativePath);
+      }
+
+      encoder.closeSync();
+    } catch (e) {
+      print('ZIP Olusturma Hatasi: $e');
+      // closeSync cagrilmamissa tekrar deneyelim
+      try {
+        encoder.closeSync();
+      } catch (_) {}
+      rethrow;
+    }
+
+    // Dogrulama: ZIP dosyasinin gercekten dolu oldugunu kontrol et
+    final zipFile = File(zipPath);
+    final zipSize = zipFile.existsSync() ? zipFile.lengthSync() : 0;
+    print('ZIP olusturuldu: $zipPath ($zipSize bytes)');
+
+    if (zipSize == 0) {
+      throw Exception('ZIP dosyasi 0 byte — olusturma basarisiz.');
+    }
+
+    if (mounted) {
+      setState(() {
+        _status =
+            'ZIP olusturuldu: ${(zipSize / 1024).toStringAsFixed(0)} KB. Gonderiliyor...';
+      });
+    }
+
     return zipPath;
   }
 
@@ -410,10 +540,22 @@ class _MultiCamPageState extends State<MultiCamPage> {
   }
 
   Future<Directory> _createSessionFolder() async {
-    final docDir = await getApplicationDocumentsDirectory();
+    // External storage kullan — root gerekmez, dosya yoneticisiyle gorulebilir
+    Directory? baseDir;
+
+    if (Platform.isAndroid) {
+      // Android 11+ için kolay erisilebilir ve kullanicinin direk gorebilecegi klasor
+      baseDir = Directory('/storage/emulated/0/Download/Multicam');
+      if (!await baseDir.exists()) {
+        await baseDir.create(recursive: true);
+      }
+    } else {
+      baseDir = await getApplicationDocumentsDirectory();
+    }
+
     final sessionId = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
     final sessionDir = Directory(
-      '${docDir.path}${Platform.pathSeparator}sessions${Platform.pathSeparator}$sessionId',
+      '${baseDir.path}${Platform.pathSeparator}sessions${Platform.pathSeparator}$sessionId',
     );
 
     await Directory(
@@ -423,6 +565,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
       '${sessionDir.path}${Platform.pathSeparator}cam2',
     ).create(recursive: true);
 
+    print('Oturum klasoru olusturuldu: ${sessionDir.path}');
     return sessionDir;
   }
 
@@ -432,6 +575,19 @@ class _MultiCamPageState extends State<MultiCamPage> {
   }) async {
     if (!_isRecording || _isCapturing || !_isReady) return;
     _isCapturing = true;
+
+    // Track actual FPS
+    final now = DateTime.now();
+    if (_lastCaptureTime != null) {
+      final elapsed = now.difference(_lastCaptureTime!).inMilliseconds;
+      if (elapsed > 0) {
+        final instantFps = 1000.0 / elapsed;
+        _fpsHistory.add(instantFps);
+        if (_fpsHistory.length > 10) _fpsHistory.removeAt(0);
+        _actualFps = _fpsHistory.reduce((a, b) => a + b) / _fpsHistory.length;
+      }
+    }
+    _lastCaptureTime = now;
 
     try {
       final frameNo = _frameIndex;
@@ -534,6 +690,114 @@ class _MultiCamPageState extends State<MultiCamPage> {
     );
   }
 
+  void _startStatsPolling() {
+    // Initial read to warm up CPU delta
+    _systemStatsChannel.invokeMethod('getSystemStats').catchError((_) {});
+
+    _statsTimer = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) => _pollSystemStats(),
+    );
+  }
+
+  Future<void> _pollSystemStats() async {
+    try {
+      final stats = await _systemStatsChannel.invokeMethod('getSystemStats');
+      if (stats is Map && mounted) {
+        setState(() {
+          _cpuPercent = (stats['cpuPercent'] as num?)?.toDouble() ?? 0;
+          _totalRamMB = (stats['totalRamMB'] as num?)?.toDouble() ?? 0;
+          _usedRamMB = (stats['usedRamMB'] as num?)?.toDouble() ?? 0;
+          _appHeapMB = (stats['appHeapMB'] as num?)?.toDouble() ?? 0;
+          _appNativeMB = (stats['appNativeMB'] as num?)?.toDouble() ?? 0;
+        });
+      }
+    } catch (_) {
+      // silently ignore stats errors
+    }
+  }
+
+  Widget _buildStatsBar() {
+    final ramPercent = _totalRamMB > 0 ? (_usedRamMB / _totalRamMB * 100) : 0.0;
+    final fpsText = _actualFps > 0 ? _actualFps.toStringAsFixed(1) : '-';
+    final appMem = (_appHeapMB + _appNativeMB);
+
+    return Container(
+      width: double.infinity,
+      color: Colors.grey.shade900,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      child: Row(
+        children: [
+          _statChip(
+            Icons.speed,
+            'FPS',
+            fpsText,
+            _actualFps > 0 && _actualFps < 1.0
+                ? Colors.red
+                : Colors.greenAccent,
+          ),
+          const SizedBox(width: 12),
+          _statChip(
+            Icons.memory,
+            'CPU',
+            '${_cpuPercent.toStringAsFixed(1)}%',
+            _cpuPercent > 80
+                ? Colors.red
+                : _cpuPercent > 50
+                ? Colors.orange
+                : Colors.greenAccent,
+          ),
+          const SizedBox(width: 12),
+          _statChip(
+            Icons.storage,
+            'RAM',
+            '${_usedRamMB.toStringAsFixed(0)}/${_totalRamMB.toStringAsFixed(0)} MB (${ramPercent.toStringAsFixed(0)}%)',
+            ramPercent > 85
+                ? Colors.red
+                : ramPercent > 70
+                ? Colors.orange
+                : Colors.greenAccent,
+          ),
+          const SizedBox(width: 12),
+          _statChip(
+            Icons.apps,
+            'App',
+            '${appMem.toStringAsFixed(1)} MB',
+            appMem > 200 ? Colors.orange : Colors.greenAccent,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _statChip(
+    IconData icon,
+    String label,
+    String value,
+    Color valueColor,
+  ) {
+    return Expanded(
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, color: Colors.white54, size: 14),
+          const SizedBox(width: 3),
+          Flexible(
+            child: Text(
+              '$label: $value',
+              style: TextStyle(
+                color: valueColor,
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+              ),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -560,6 +824,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
               ],
             ),
           ),
+          _buildStatsBar(),
           Container(
             width: double.infinity,
             color: Colors.black,
@@ -595,7 +860,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
                 ),
                 Slider(
                   value: _captureIntervalMs.toDouble(),
-                  min: 200,
+                  min: 20,
                   max: 2000,
                   divisions: 18,
                   label: '$_captureIntervalMs ms',

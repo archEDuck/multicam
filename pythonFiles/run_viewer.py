@@ -47,7 +47,7 @@ def main():
         print(f"  [-] Hata: {str(e)}")
 
     print("\n[*] 2. Yöntem: Harici Depolama (External Storage) Yeni Kayıtlar Çekiliyor...")
-    ext_path = "/sdcard/Android/data/com.example.multicam/files/sessions/"
+    ext_path = "/sdcard/Download/Multicam/sessions/"
     ext_cmd = f'adb pull {ext_path} "{base_dir}"'
     pull_proc = run_adb_command(ext_cmd)
     

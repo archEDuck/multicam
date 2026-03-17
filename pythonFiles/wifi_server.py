@@ -17,16 +17,14 @@ class UploadHandler(BaseHTTPRequestHandler):
         if parsed_path.path == '/upload':
             query = parse_qs(parsed_path.query)
             filename = query.get('file', ['session.zip'])[0]
+            filepath = os.path.join(SESSIONS_DIR, filename)
             content_length = int(self.headers.get('Content-Length', 0))
             
+            print(f"\n[*] '{filename}' dosyası alınıyor... Content-Length: {content_length} bytes")
             if content_length == 0:
-                self.send_error(400, "Bad Request: No content")
+                self.send_error(400, "Bad Request: No content (Length 0)")
+                print("  [-] Hata: Gelen icerik boyutu 0. Gonderim bossa, Flutter tarafinda olusturulan Zip bos olabilir.")
                 return
-            
-            filepath = os.path.join(SESSIONS_DIR, filename)
-            
-            # Cihazdan gelen dosyayi diske yaz
-            print(f"\\n[*] '{filename}' dosyası alınıyor...")
             with open(filepath, 'wb') as f:
                 chunk_size = 65536
                 bytes_read = 0
@@ -157,7 +155,7 @@ class UploadHandler(BaseHTTPRequestHandler):
 
         function fmt(val) {{
             if (!val || val.trim() === "") return "0.00";
-            return parseFloat(val).toFixed(2).padStart(6, '\\xa0');
+            return parseFloat(val).toFixed(2).padStart(6, '\xa0');
         }}
 
         function updateView() {{
@@ -200,14 +198,15 @@ class UploadHandler(BaseHTTPRequestHandler):
         webbrowser.open(f"file://{html_path}")
 
 def run(server_class=HTTPServer, handler_class=UploadHandler, port=5000):
-    local_ip = "127.0.0.1"
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-    except:
-        pass
+    local_ip = "188.191.107.81"
+    # Sunucu IP'sini bildiğimiz için otomatik bulma kısmını devre dışı bırakıyoruz
+    # try:
+    #     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    #     s.connect(("8.8.8.8", 80))
+    #     local_ip = s.getsockname()[0]
+    #     s.close()
+    # except:
+    #     pass
 
     server_address = ('0.0.0.0', port)
     httpd = server_class(server_address, handler_class)
@@ -227,7 +226,7 @@ def run(server_class=HTTPServer, handler_class=UploadHandler, port=5000):
         pass
     
     httpd.server_close()
-    print("\\n[-] Sunucu kapatildi.")
+    print("\n[-] Sunucu kapatildi.")
 
 if __name__ == '__main__':
     run()

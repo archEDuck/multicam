@@ -1,5 +1,6 @@
 package com.example.multicam
 
+import android.app.ActivityManager
 import android.content.Context
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
@@ -8,16 +9,19 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.Build
+import android.os.Debug
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import java.io.RandomAccessFile
 
 class MainActivity : FlutterActivity() {
 	private val fotChannel = "multicam/fot_sensor"
 	private val camera2BridgeChannel = "multicam/camera2_bridge"
 	private val dualCameraChannel = "multicam/dual_camera"
+	private val systemStatsChannel = "multicam/system_stats"
 
 	override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
 		super.configureFlutterEngine(flutterEngine)
@@ -30,6 +34,9 @@ class MainActivity : FlutterActivity() {
 
 		MethodChannel(flutterEngine.dartExecutor.binaryMessenger, dualCameraChannel)
 			.setMethodCallHandler(DualCameraHandler(this))
+
+		MethodChannel(flutterEngine.dartExecutor.binaryMessenger, systemStatsChannel)
+			.setMethodCallHandler(SystemStatsHandler(this))
 	}
 }
 
@@ -219,5 +226,83 @@ private class FotSensorStreamHandler(
 
 	override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
 		// No-op
+	}
+}
+
+/**
+ * Provides system stats (CPU usage, RAM usage) via MethodChannel.
+ */
+private class SystemStatsHandler(
+	context: Context,
+) : MethodChannel.MethodCallHandler {
+	private val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+	private var lastCpuIdle: Long = 0
+	private var lastCpuTotal: Long = 0
+
+	override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
+		when (call.method) {
+			"getSystemStats" -> {
+				try {
+					result.success(buildStats())
+				} catch (e: Exception) {
+					result.error("STATS_ERROR", e.message, null)
+				}
+			}
+			else -> result.notImplemented()
+		}
+	}
+
+	private fun buildStats(): Map<String, Any> {
+		// --- CPU usage from /proc/stat ---
+		var cpuPercent = 0.0
+		try {
+			val reader = RandomAccessFile("/proc/stat", "r")
+			val line = reader.readLine() // first line: cpu  user nice system idle ...
+			reader.close()
+
+			val parts = line.split("\\s+".toRegex())
+			// parts[0]="cpu", parts[1..]=user, nice, system, idle, iowait, irq, softirq, ...
+			if (parts.size >= 5) {
+				var total = 0L
+				for (i in 1 until parts.size) {
+					total += parts[i].toLongOrNull() ?: 0
+				}
+				val idle = parts[4].toLongOrNull() ?: 0
+
+				if (lastCpuTotal > 0) {
+					val diffTotal = total - lastCpuTotal
+					val diffIdle = idle - lastCpuIdle
+					if (diffTotal > 0) {
+						cpuPercent = ((diffTotal - diffIdle).toDouble() / diffTotal) * 100.0
+					}
+				}
+				lastCpuTotal = total
+				lastCpuIdle = idle
+			}
+		} catch (_: Exception) {
+			cpuPercent = -1.0
+		}
+
+		// --- RAM usage ---
+		val memInfo = ActivityManager.MemoryInfo()
+		activityManager.getMemoryInfo(memInfo)
+
+		val totalRamMB = memInfo.totalMem / (1024.0 * 1024.0)
+		val availRamMB = memInfo.availMem / (1024.0 * 1024.0)
+		val usedRamMB = totalRamMB - availRamMB
+
+		// App-specific memory
+		val rt = Runtime.getRuntime()
+		val appHeapMB = (rt.totalMemory() - rt.freeMemory()) / (1024.0 * 1024.0)
+		val nativeHeapMB = Debug.getNativeHeapAllocatedSize() / (1024.0 * 1024.0)
+
+		return mapOf(
+			"cpuPercent" to String.format("%.1f", cpuPercent).toDouble(),
+			"totalRamMB" to String.format("%.0f", totalRamMB).toDouble(),
+			"availRamMB" to String.format("%.0f", availRamMB).toDouble(),
+			"usedRamMB" to String.format("%.0f", usedRamMB).toDouble(),
+			"appHeapMB" to String.format("%.1f", appHeapMB).toDouble(),
+			"appNativeMB" to String.format("%.1f", nativeHeapMB).toDouble(),
+		)
 	}
 }
