@@ -473,23 +473,9 @@ class _MultiCamPageState extends State<MultiCamPage> {
     final encoder = ZipFileEncoder();
 
     try {
-      encoder.create(zipPath);
-
-      for (final file in allFiles) {
-        if (!file.existsSync()) continue;
-        final relativePath = file.path
-            .substring(sessionDir.path.length + 1)
-            .replaceAll(Platform.pathSeparator, '/');
-        encoder.addFile(file, relativePath);
-      }
-
-      encoder.closeSync();
+      encoder.zipDirectory(sessionDir, filename: zipPath);
     } catch (e) {
       print('ZIP Olusturma Hatasi: $e');
-      // closeSync cagrilmamissa tekrar deneyelim
-      try {
-        encoder.closeSync();
-      } catch (_) {}
       rethrow;
     }
 
