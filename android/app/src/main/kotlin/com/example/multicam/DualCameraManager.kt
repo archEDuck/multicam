@@ -3,8 +3,14 @@ package com.example.multicam
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.ImageFormat
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.hardware.camera2.*
+import android.hardware.camera2.params.StreamConfigurationMap
 import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.RggbChannelVector
 import android.hardware.camera2.params.SessionConfiguration
 import android.media.ImageReader
 import android.os.Build
@@ -49,6 +55,19 @@ class DualCameraManager(private val context: Context) {
     )
 
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+    private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+    private val lightSensor: Sensor? = sensorManager.getDefaultSensor(Sensor.TYPE_LIGHT)
+    
+    @Volatile private var latestLux = "0.0"
+
+    private val lightSensorListener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent?) {
+            if (event?.sensor?.type == Sensor.TYPE_LIGHT) {
+                latestLux = event.values[0].toString()
+            }
+        }
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    }
 
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
@@ -66,6 +85,20 @@ class DualCameraManager(private val context: Context) {
     // For ALTERNATING mode
     private var altCam1Id: String? = null
     private var altCam2Id: String? = null
+
+    // Metadata for current session
+    private var intrinsicsFx = ""
+    private var intrinsicsFy = ""
+    private var intrinsicsCx = ""
+    private var intrinsicsCy = ""
+    private var distK1 = ""
+    private var distK2 = ""
+    private var distP1 = ""
+    private var distP2 = ""
+    private var distK3 = ""
+    @Volatile private var latestExposureMs = ""
+    @Volatile private var latestIso = ""
+    @Volatile private var latestKelvin = "0"
 
     var captureMode: CaptureMode? = null
         private set
@@ -119,40 +152,113 @@ class DualCameraManager(private val context: Context) {
     fun findBestConcurrentPair(): Map<String, Any> {
         val logicalInfo = findLogicalMultiCamera()
         if (logicalInfo != null) {
-            return mapOf(
-                "found" to true,
-                "cam1Id" to logicalInfo.physicalId1,
-                "cam2Id" to logicalInfo.physicalId2,
-                "logicalId" to logicalInfo.logicalId,
-                "mode" to "logical_multi_camera",
+            val candidates = listOf(
+                logicalInfo.physicalId1 to logicalInfo.physicalId2,
+                logicalInfo.physicalId2 to logicalInfo.physicalId1,
             )
+            val best = chooseBestPair(candidates)
+            if (best != null) {
+                return mapOf(
+                    "found" to true,
+                    "cam1Id" to best.first,
+                    "cam2Id" to best.second,
+                    "logicalId" to logicalInfo.logicalId,
+                    "mode" to "logical_multi_camera",
+                )
+            }
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val backIds = getBackCameraIds()
+            val candidates = mutableListOf<Pair<String, String>>()
             for (group in cameraManager.concurrentCameraIds) {
                 val backInGroup = group.filter { backIds.contains(it) }
                 if (backInGroup.size >= 2) {
-                    return mapOf(
-                        "found" to true,
-                        "cam1Id" to backInGroup[0],
-                        "cam2Id" to backInGroup[1],
-                        "mode" to "concurrent",
-                    )
+                    for (i in 0 until backInGroup.size - 1) {
+                        for (j in i + 1 until backInGroup.size) {
+                            candidates.add(backInGroup[i] to backInGroup[j])
+                        }
+                    }
                 }
+            }
+            val best = chooseBestPair(candidates)
+            if (best != null) {
+                return mapOf(
+                    "found" to true,
+                    "cam1Id" to best.first,
+                    "cam2Id" to best.second,
+                    "mode" to "concurrent",
+                )
             }
         }
 
         val backIds = getBackCameraIds()
-        return if (backIds.size >= 2) {
+        val fallbackCandidates = mutableListOf<Pair<String, String>>()
+        for (i in 0 until backIds.size - 1) {
+            for (j in i + 1 until backIds.size) {
+                fallbackCandidates.add(backIds[i] to backIds[j])
+            }
+        }
+        val bestFallback = chooseBestPair(fallbackCandidates)
+        return if (bestFallback != null) {
             mapOf(
                 "found" to true,
-                "cam1Id" to backIds[0],
-                "cam2Id" to backIds[1],
+                "cam1Id" to bestFallback.first,
+                "cam2Id" to bestFallback.second,
                 "mode" to "alternating",
             )
         } else {
             mapOf("found" to false)
+        }
+    }
+
+    private fun chooseBestPair(candidates: List<Pair<String, String>>): Pair<String, String>? {
+        if (candidates.isEmpty()) return null
+
+        val scored = candidates.mapNotNull { pair ->
+            val id1 = pair.first
+            val id2 = pair.second
+
+            val supportsSize = supportsJpegSize(id1, IMAGE_WIDTH, IMAGE_HEIGHT) &&
+                supportsJpegSize(id2, IMAGE_WIDTH, IMAGE_HEIGHT)
+            val f1 = getPrimaryFocalLength(id1)
+            val f2 = getPrimaryFocalLength(id2)
+            val focalDelta = if (f1 != null && f2 != null) kotlin.math.abs(f1 - f2) else 999f
+
+            // Büyük focal farkı genelde depth/yardımcı sensör seçimine işaret eder.
+            val score = (if (supportsSize) 1000f else 0f) - focalDelta
+
+            Triple(pair, score, supportsSize)
+        }
+
+        if (scored.isEmpty()) return null
+
+        val best = scored.maxByOrNull { it.second } ?: return null
+        if (!best.third) {
+            // En iyi aday bile hedef boyutu desteklemiyorsa yine de fallback için döndür.
+            Log.w(TAG, "No pair fully supports ${IMAGE_WIDTH}x${IMAGE_HEIGHT}; falling back to best effort pair")
+        }
+        return best.first
+    }
+
+    private fun supportsJpegSize(cameraId: String, width: Int, height: Int): Boolean {
+        return try {
+            val chars = cameraManager.getCameraCharacteristics(cameraId)
+            val configMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val sizes = configMap?.getOutputSizes(ImageFormat.JPEG) ?: return false
+            sizes.any { it.width == width && it.height == height }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun getPrimaryFocalLength(cameraId: String): Float? {
+        return try {
+            val chars = cameraManager.getCameraCharacteristics(cameraId)
+            val focals = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+            if (focals == null || focals.isEmpty()) null else focals.minOrNull()
+        } catch (_: Exception) {
+            null
         }
     }
 
@@ -163,6 +269,12 @@ class DualCameraManager(private val context: Context) {
         if (isOpen) closeCameras()
         startBackgroundThread()
 
+        lightSensor?.let {
+            sensorManager.registerListener(lightSensorListener, it, SensorManager.SENSOR_DELAY_NORMAL, backgroundHandler)
+        }
+
+        extractIntrinsicsAndDistortion(cam1Id)
+
         val logicalInfo = findLogicalMultiCameraContaining(cam1Id, cam2Id)
         if (logicalInfo != null) {
             val result = openLogicalMultiCamera(logicalInfo)
@@ -171,6 +283,45 @@ class DualCameraManager(private val context: Context) {
         }
 
         return openAlternating(cam1Id, cam2Id)
+    }
+
+    private fun extractIntrinsicsAndDistortion(cameraId: String) {
+        try {
+            val chars = cameraManager.getCameraCharacteristics(cameraId)
+            val intrinsics = chars.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION)
+            if (intrinsics != null && intrinsics.size >= 5) {
+                intrinsicsFx = intrinsics[0].toString()
+                intrinsicsFy = intrinsics[1].toString()
+                intrinsicsCx = intrinsics[2].toString()
+                intrinsicsCy = intrinsics[3].toString()
+            } else {
+                intrinsicsFx = ""; intrinsicsFy = ""; intrinsicsCx = ""; intrinsicsCy = ""
+            }
+
+            // Android exposes radial distortion: [kappa_1, kappa_2, kappa_3, kappa_4, kappa_5, kappa_6] usually
+            // We'll just map first 5 if available
+            val distortions = chars.get(CameraCharacteristics.LENS_RADIAL_DISTORTION)
+            if (distortions != null && distortions.size >= 5) {
+                distK1 = distortions[0].toString()
+                distK2 = distortions[1].toString()
+                distP1 = distortions[2].toString()
+                distP2 = distortions[3].toString()
+                distK3 = distortions[4].toString()
+            } else {
+                val legacyDistortion = chars.get(CameraCharacteristics.LENS_DISTORTION)
+                if (legacyDistortion != null && legacyDistortion.size >= 5) {
+                    distK1 = legacyDistortion[0].toString()
+                    distK2 = legacyDistortion[1].toString()
+                    distP1 = legacyDistortion[2].toString()
+                    distP2 = legacyDistortion[3].toString()
+                    distK3 = legacyDistortion[4].toString()
+                } else {
+                    distK1 = ""; distK2 = ""; distP1 = ""; distP2 = ""; distK3 = ""
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error extracting calibration for $cameraId", e)
+        }
     }
 
     private fun findLogicalMultiCameraContaining(phys1: String, phys2: String): LogicalCameraInfo? {
@@ -317,7 +468,25 @@ class DualCameraManager(private val context: Context) {
                 set(CaptureRequest.JPEG_ORIENTATION, 90)
             }.build()
 
-            logicalSession!!.setRepeatingRequest(previewRequest, null, backgroundHandler)
+            val captureCallback = object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                    val expTime = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                    val iso = result.get(CaptureResult.SENSOR_SENSITIVITY)
+                    val gains = result.get(CaptureResult.COLOR_CORRECTION_GAINS)
+                    
+                    if (expTime != null) {
+                        latestExposureMs = java.lang.String.format(java.util.Locale.US, "%.2f", expTime / 1000000.0)
+                    }
+                    if (iso != null) {
+                        latestIso = iso.toString()
+                    }
+                    if (gains != null) {
+                        latestKelvin = estimateCCT(gains)
+                    }
+                }
+            }
+
+            logicalSession!!.setRepeatingRequest(previewRequest, captureCallback, backgroundHandler)
             Log.i(TAG, "Repeating preview started for both physical cameras")
 
             // Wait a moment for auto-exposure/focus to converge
@@ -362,11 +531,40 @@ class DualCameraManager(private val context: Context) {
             return mapOf("success" to false, "error" to "Not open", "cam1Saved" to false, "cam2Saved" to false)
         }
 
-        return when (captureMode) {
+        val baseMap = when (captureMode) {
             CaptureMode.LOGICAL_MULTI_CAMERA -> captureLogicalMultiCamera(cam1Path, cam2Path)
             CaptureMode.ALTERNATING -> captureAlternating(cam1Path, cam2Path)
             else -> mapOf("success" to false, "error" to "Unknown mode", "cam1Saved" to false, "cam2Saved" to false)
         }
+
+        val result = baseMap.toMutableMap()
+        result["fx"] = intrinsicsFx
+        result["fy"] = intrinsicsFy
+        result["cx"] = intrinsicsCx
+        result["cy"] = intrinsicsCy
+        result["k1"] = distK1
+        result["k2"] = distK2
+        result["p1"] = distP1
+        result["p2"] = distP2
+        result["k3"] = distK3
+        result["exposure_ms"] = latestExposureMs
+        result["iso"] = latestIso
+        
+        result["lux"] = latestLux
+        // Estimated from COLOR_CORRECTION_GAINS
+        result["kelvin"] = latestKelvin
+        // Mocked or external values from ARCore if not available natively here
+        result["plane_data"] = ""
+        result["bbox_data"] = ""
+        result["cam1Id"] = physicalId1 ?: altCam1Id ?: ""
+        result["cam2Id"] = physicalId2 ?: altCam2Id ?: ""
+        result["capture_mode"] = when (captureMode) {
+            CaptureMode.LOGICAL_MULTI_CAMERA -> "logical_multi_camera"
+            CaptureMode.ALTERNATING -> "alternating"
+            else -> ""
+        }
+
+        return result
     }
 
     /**
@@ -476,7 +674,20 @@ class DualCameraManager(private val context: Context) {
                 set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
                 set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
             }.build()
-            session!!.setRepeatingRequest(previewRequest, null, backgroundHandler)
+
+            val captureCallback = object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                    val expTime = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                    val iso = result.get(CaptureResult.SENSOR_SENSITIVITY)
+                    val gains = result.get(CaptureResult.COLOR_CORRECTION_GAINS)
+                    
+                    if (expTime != null) latestExposureMs = String.format("%.2f", expTime / 1000000.0)
+                    if (iso != null) latestIso = iso.toString()
+                    if (gains != null) latestKelvin = estimateCCT(gains)
+                }
+            }
+
+            session!!.setRepeatingRequest(previewRequest, captureCallback, backgroundHandler)
             Thread.sleep(800) // Let AE/AF converge thoroughly
             session!!.stopRepeating()
 
@@ -511,7 +722,19 @@ class DualCameraManager(private val context: Context) {
                 set(CaptureRequest.JPEG_ORIENTATION, 90)
             }.build()
 
-            session!!.capture(stillRequest, null, backgroundHandler)
+            val stillCaptureCallback = object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                    val expTime = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                    val iso = result.get(CaptureResult.SENSOR_SENSITIVITY)
+                    val gains = result.get(CaptureResult.COLOR_CORRECTION_GAINS)
+                    
+                    if (expTime != null) latestExposureMs = java.lang.String.format(java.util.Locale.US, "%.2f", expTime / 1000000.0)
+                    if (iso != null) latestIso = iso.toString()
+                    if (gains != null) latestKelvin = estimateCCT(gains)
+                }
+            }
+
+            session!!.capture(stillRequest, stillCaptureCallback, backgroundHandler)
             captureLatch.await(CAPTURE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
 
             return saved
@@ -532,6 +755,9 @@ class DualCameraManager(private val context: Context) {
     }
 
     fun closeCameras() {
+        try {
+            sensorManager.unregisterListener(lightSensorListener)
+        } catch (_: Exception) {}
         try {
             logicalSession?.stopRepeating()
         } catch (_: Exception) {}
@@ -592,5 +818,45 @@ class DualCameraManager(private val context: Context) {
             }
         }
         return allIdsToInspect.filter { isBackCamera(it) }
+    }
+
+    private fun estimateCCT(gains: RggbChannelVector): String {
+        // Gain values returned by Android are the multiplier applied by the ISP 
+        // to make a neutral (white) scene look white. The illuminant color is therefore
+        // proportional to the inverse of the gains.
+        val rGain = gains.red.toDouble()
+        val gGain = (gains.greenEven.toDouble() + gains.greenOdd.toDouble()) / 2.0
+        val bGain = gains.blue.toDouble()
+
+        if (rGain == 0.0 || gGain == 0.0 || bGain == 0.0) return "0"
+
+        var R = 1.0 / rGain
+        var G = 1.0 / gGain
+        var B = 1.0 / bGain
+
+        // Normalize scaling so that G = 1.0
+        R /= G
+        B /= G
+        G = 1.0
+
+        // Approximate RGB to XYZ transformation (using sRGB D65 as reference base)
+        val X = 0.4124564 * R + 0.3575761 * G + 0.1804375 * B
+        val Y = 0.2126729 * R + 0.7151522 * G + 0.0721750 * B
+        val Z = 0.0193339 * R + 0.1191920 * G + 0.9503041 * B
+
+        val sum = X + Y + Z
+        if (sum == 0.0) return "0"
+
+        // Compute CIE xy chromaticity coordinates
+        val x = X / sum
+        val y = Y / sum
+
+        // McCamy's approximation formula for Correlated Color Temperature (CCT)
+        val n = (x - 0.3320) / (0.1858 - y)
+        val cct = 449.0 * Math.pow(n, 3.0) + 3525.0 * Math.pow(n, 2.0) + 6823.3 * n + 5520.33
+
+        // Clamp to typical temperature range realistically returned by auto-white balance (e.g., 2000K-10000K)
+        val clampedCct = Math.max(2000.0, Math.min(10000.0, cct))
+        return Math.round(clampedCct).toString()
     }
 }

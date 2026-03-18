@@ -357,7 +357,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
       '${sessionDir.path}${Platform.pathSeparator}capture_log.csv',
     );
     await csvFile.writeAsString(
-      'frame,timestamp_utc,cam1_image,cam2_image,fot_cm,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,pose_tx,pose_ty,pose_tz,pose_qx,pose_qy,pose_qz,pose_qw,fx,fy,cx,cy,k1,k2,p1,p2,k3,lux,kelvin,exposure_ms,iso,plane_data,bbox_data\n',
+      'frame,timestamp_utc,cam1_image,cam2_image,fot_cm,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,pose_tx,pose_ty,pose_tz,pose_qx,pose_qy,pose_qz,pose_qw,fx,fy,cx,cy,k1,k2,p1,p2,k3,lux,kelvin,exposure_ms,iso,plane_data,bbox_data,cam1_id,cam2_id,capture_mode\n',
       flush: true,
     );
 
@@ -587,6 +587,8 @@ class _MultiCamPageState extends State<MultiCamPage> {
     final timestamp = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
     final String modePrefix = _sessionMode == 'Kalibrasyon'
         ? 'calib_'
+        : _sessionMode == 'Kalibreli'
+        ? 'rectify_'
         : _sessionMode == '3D Orbit Tarama'
         ? 'orbit_'
         : '';
@@ -665,13 +667,35 @@ class _MultiCamPageState extends State<MultiCamPage> {
       }
 
       final fotValue = _fmt(_fotCm, digits: 3);
+
+      // Extract extra sensor/camera metadata if provided from Native/ARCore bridge
+      final fx = result['fx'] ?? '';
+      final fy = result['fy'] ?? '';
+      final cx = result['cx'] ?? '';
+      final cy = result['cy'] ?? '';
+      final k1 = result['k1'] ?? '';
+      final k2 = result['k2'] ?? '';
+      final p1 = result['p1'] ?? '';
+      final p2 = result['p2'] ?? '';
+      final k3 = result['k3'] ?? '';
+      final lux = result['lux'] ?? '';
+      final kelvin = result['kelvin'] ?? '';
+      final expMs = result['exposure_ms'] ?? '';
+      final iso = result['iso'] ?? '';
+      final planeInfo = result['plane_data'] ?? '';
+      final bboxInfo = result['bbox_data'] ?? '';
+      final cam1Id = result['cam1Id'] ?? _cam1Id ?? '';
+      final cam2Id = result['cam2Id'] ?? _cam2Id ?? '';
+      final captureMode = result['capture_mode'] ?? '';
+
       final line =
-          '$frameNo,${now.toIso8601String()},${cam1Saved ? cam1Relative : ''},${cam2Saved ? cam2Relative : ''},$fotValue,${_fmt(_accX)},${_fmt(_accY)},${_fmt(_accZ)},${_fmt(_gyroX)},${_fmt(_gyroY)},${_fmt(_gyroZ)},${_fmt(_poseTx)},${_fmt(_poseTy)},${_fmt(_poseTz)},${_fmt(_poseQx)},${_fmt(_poseQy)},${_fmt(_poseQz)},${_fmt(_poseQw)}\n';
+          '$frameNo,${now.toIso8601String()},${cam1Saved ? cam1Relative : ''},${cam2Saved ? cam2Relative : ''},$fotValue,${_fmt(_accX)},${_fmt(_accY)},${_fmt(_accZ)},${_fmt(_gyroX)},${_fmt(_gyroY)},${_fmt(_gyroZ)},${_fmt(_poseTx)},${_fmt(_poseTy)},${_fmt(_poseTz)},${_fmt(_poseQx)},${_fmt(_poseQy)},${_fmt(_poseQz)},${_fmt(_poseQw)},$fx,$fy,$cx,$cy,$k1,$k2,$p1,$p2,$k3,$lux,$kelvin,$expMs,$iso,"$planeInfo","$bboxInfo",$cam1Id,$cam2Id,$captureMode\n';
 
       await csvFile.writeAsString(line, mode: FileMode.append, flush: true);
     } catch (error) {
+      final errorCommas = ',' * 33; // Fill the rest of the columns
       final line =
-          '${_frameIndex - 1},${DateTime.now().toUtc().toIso8601String()},,,ERROR:$error,,,,,,\n';
+          '${_frameIndex - 1},${DateTime.now().toUtc().toIso8601String()},,,ERROR:$error$errorCommas\n';
       await csvFile.writeAsString(line, mode: FileMode.append, flush: true);
     } finally {
       _isCapturing = false;
@@ -853,7 +877,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
               color: Colors.lightBlueAccent,
               fontWeight: FontWeight.bold,
             ),
-            items: ['Normal', 'Kalibrasyon', '3D Orbit Tarama']
+            items: ['Normal', 'Kalibrasyon', 'Kalibreli', '3D Orbit Tarama']
                 .map((mode) => DropdownMenuItem(value: mode, child: Text(mode)))
                 .toList(),
             onChanged: _isRecording

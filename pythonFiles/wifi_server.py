@@ -96,18 +96,19 @@ class UploadHandler(BaseHTTPRequestHandler):
             else:
                 print("  [-] OpenCV / NumPy yüklü değil, Kalibrasyon atlandı.")
 
-        if session_name.startswith("depth_"):
+        if session_name.startswith("rectify_"):
             if stereo_processor is not None:
-                success, results = stereo_processor.process_depth_session(extract_dir)
+                success, results = stereo_processor.process_rectification_session(extract_dir)
                 if success:
-                    print(f"  [+] Derinlik Haritası başarıyla çıkartıldı.")
-                    # Burada results içerisindeki "depth_image" yollarını records dizisine ekleyebiliriz
+                    print(f"  [+] Görüntüler başarıyla hizalandı (Rectified).")
+                    # Burada results içerisindeki yolları records dizisine ekleyebiliriz
                     for r, rec in zip(results, records):
-                        rec["depth_image"] = r["depth_image"]
+                        rec["rectified_cam1"] = r.get("rectified_cam1", "")
+                        rec["rectified_cam2"] = r.get("rectified_cam2", "")
                 else:
-                    print(f"  [-] Derinlik Hesaplama Hatası: {results}")
+                    print(f"  [-] Hizalama Hatası: {results}")
             else:
-                print("  [-] OpenCV yüklü değil, Derinlik işlemi yapılamıyor.")
+                print("  [-] OpenCV yüklü değil, Hizalama (Rectification) işlemi yapılamıyor.")
 
         if session_name.startswith("orbit_"):
             if nerf_processor is not None:
@@ -218,8 +219,8 @@ class UploadHandler(BaseHTTPRequestHandler):
             const idx = parseInt(slider.value, 10);
             const frame = data[idx];
             
-            img1.src = frame.cam1_image || "";
-            img2.src = frame.cam2_image || "";
+            img1.src = frame.rectified_cam1 || frame.cam1_image || "";
+            img2.src = frame.rectified_cam2 || frame.cam2_image || "";
             if (frame.depth_image) {{
                 depthBox.style.display = 'block';
                 imgDepth.src = frame.depth_image;
