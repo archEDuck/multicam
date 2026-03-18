@@ -136,12 +136,28 @@ private class Camera2BridgeHandler(
 	private fun buildBackCameraReport(): Map<String, Any> {
 		val cameras = mutableListOf<Map<String, Any>>()
 		val backIds = mutableListOf<String>()
+		val allIdsToInspect = mutableSetOf<String>()
+		
+		for (id in cameraManager.cameraIdList) {
+			allIdsToInspect.add(id)
+			if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+				try {
+					val characteristics = cameraManager.getCameraCharacteristics(id)
+					for (physicalId in characteristics.physicalCameraIds) {
+						allIdsToInspect.add(physicalId)
+					}
+				} catch (e: Exception) {
+				}
+			}
+		}
 
-		for (cameraId in cameraManager.cameraIdList) {
+		for (cameraId in allIdsToInspect) {
 			val characteristics = cameraManager.getCameraCharacteristics(cameraId)
 			val lensFacing = characteristics.get(CameraCharacteristics.LENS_FACING)
 			if (lensFacing == CameraCharacteristics.LENS_FACING_BACK) {
-				backIds.add(cameraId)
+				if (!backIds.contains(cameraId)) {
+					backIds.add(cameraId)
+				}
 			}
 
 			val capabilities = characteristics

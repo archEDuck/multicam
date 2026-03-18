@@ -7,6 +7,18 @@ import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
+try:
+    import stereo_processor
+except ImportError:
+    stereo_processor = None
+    pass
+
+try:
+    import nerf_processor
+except ImportError:
+    nerf_processor = None
+    pass
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
@@ -72,6 +84,43 @@ class UploadHandler(BaseHTTPRequestHandler):
                 records.append(row)
         
         session_name = os.path.basename(extract_dir)
+
+        # ====== HETEROGENEOUS STEREO YÖNETİMİ ======
+        if session_name.startswith("calib_"):
+            if stereo_processor is not None:
+                success, msg = stereo_processor.calibrate_and_save(extract_dir)
+                if success:
+                    print(f"  [+] {msg}")
+                else:
+                    print(f"  [-] Kalibrasyon Hatası: {msg}")
+            else:
+                print("  [-] OpenCV / NumPy yüklü değil, Kalibrasyon atlandı.")
+
+        if session_name.startswith("depth_"):
+            if stereo_processor is not None:
+                success, results = stereo_processor.process_depth_session(extract_dir)
+                if success:
+                    print(f"  [+] Derinlik Haritası başarıyla çıkartıldı.")
+                    # Burada results içerisindeki "depth_image" yollarını records dizisine ekleyebiliriz
+                    for r, rec in zip(results, records):
+                        rec["depth_image"] = r["depth_image"]
+                else:
+                    print(f"  [-] Derinlik Hesaplama Hatası: {results}")
+            else:
+                print("  [-] OpenCV yüklü değil, Derinlik işlemi yapılamıyor.")
+
+        if session_name.startswith("orbit_"):
+            if nerf_processor is not None:
+                success, msg = nerf_processor.process_orbit_session(extract_dir)
+                if success:
+                    print(f"  [+] 3D Orbit (NeRF/Splat) veri hazırlığı başarıyla tamamlandı: {msg}")
+                else:
+                    print(f"  [-] Orbit İşlem Hatası: {msg}")
+            else:
+                print("  [-] nerf_processor yüklenemedi.")
+
+        # ============================================
+
         json_data_str = json.dumps(records)
         
         html_content = f"""<!DOCTYPE html>
@@ -99,15 +148,20 @@ class UploadHandler(BaseHTTPRequestHandler):
     <h2>Oturum İnceleme ({session_name})</h2>
     
     <div class="container">
-        <div class="cam-box">
+        <div class="cam-box" style="width: 30vw;">
             <h3 style="margin: 10px 0; color: #cdd6f4;">Arka Kamera 1</h3>
             <img id="cam1" src="" onerror="this.style.display='none'; document.getElementById('ph1').style.display='flex';" onload="this.style.display='block'; document.getElementById('ph1').style.display='none';">
             <div id="ph1" class="empty-placeholder">Görüntü Yok</div>
         </div>
-        <div class="cam-box">
+        <div class="cam-box" style="width: 30vw;">
             <h3 style="margin: 10px 0; color: #cdd6f4;">Arka Kamera 2</h3>
             <img id="cam2" src="" onerror="this.style.display='none'; document.getElementById('ph2').style.display='flex';" onload="this.style.display='block'; document.getElementById('ph2').style.display='none';">
             <div id="ph2" class="empty-placeholder">Görüntü Yok</div>
+        </div>
+        <div class="cam-box" style="width: 30vw;" id="depthBox">
+            <h3 style="margin: 10px 0; color: #cdd6f4;">Derinlik Haritası</h3>
+            <img id="depthImg" src="" onerror="this.style.display='none'; document.getElementById('ph3').style.display='flex';" onload="this.style.display='block'; document.getElementById('ph3').style.display='none';">
+            <div id="ph3" class="empty-placeholder">Görüntü Yok</div>
         </div>
     </div>
 
@@ -142,6 +196,8 @@ class UploadHandler(BaseHTTPRequestHandler):
         const slider = document.getElementById("slider");
         const img1 = document.getElementById("cam1");
         const img2 = document.getElementById("cam2");
+        const imgDepth = document.getElementById("depthImg");
+        const depthBox = document.getElementById("depthBox");
         const frameCounter = document.getElementById("frame_counter");
         const fotLbl = document.getElementById("fot_lbl");
         const accLbl = document.getElementById("acc_lbl");
@@ -164,7 +220,13 @@ class UploadHandler(BaseHTTPRequestHandler):
             
             img1.src = frame.cam1_image || "";
             img2.src = frame.cam2_image || "";
-            
+            if (frame.depth_image) {{
+                depthBox.style.display = 'block';
+                imgDepth.src = frame.depth_image;
+            }} else {{
+                depthBox.style.display = 'none';
+            }}
+
             frameCounter.innerText = `${{idx + 1}} / ${{data.length}}`;
             
             if (frame.timestamp_utc) {{
@@ -198,7 +260,7 @@ class UploadHandler(BaseHTTPRequestHandler):
         webbrowser.open(f"file://{html_path}")
 
 def run(server_class=HTTPServer, handler_class=UploadHandler, port=5000):
-    local_ip = "188.191.107.81"
+    local_ip = "22.29.34.191"
     # Sunucu IP'sini bildiğimiz için otomatik bulma kısmını devre dışı bırakıyoruz
     # try:
     #     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

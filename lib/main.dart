@@ -63,9 +63,11 @@ class _MultiCamPageState extends State<MultiCamPage> {
   String? _sessionPath;
   int _frameIndex = 0;
   int _captureIntervalMs = 700;
+  String _sessionMode = 'Normal';
+  String _viewMode = 'Çift Kamera';
   final TextEditingController _ipController = TextEditingController(
     text:
-        '127.0.0.1', // USB uzerinden adb reverse kullanilacak (veya 10.0.2.2 emulator icin)
+        '188.191.107.81', // USB uzerinden adb reverse kullanilacak (veya 10.0.2.2 emulator icin)
   );
 
   double? _accX;
@@ -75,10 +77,19 @@ class _MultiCamPageState extends State<MultiCamPage> {
   double? _gyroY;
   double? _gyroZ;
 
+  double? _poseTx;
+  double? _poseTy;
+  double? _poseTz;
+  double? _poseQx;
+  double? _poseQy;
+  double? _poseQz;
+  double? _poseQw;
+
   File? _activeCsvFile;
   Directory? _activeSessionDir;
 
   // Native dual camera state
+  List<String> _availableBackCameraIds = [];
   String? _cam1Id;
   String? _cam2Id;
   File? _lastCam1Frame;
@@ -161,6 +172,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
 
       if (!mounted) return;
       setState(() {
+        _availableBackCameraIds = backCameraIds;
         _camera2Status =
             'Camera2: ${backCameraIds.length} arka kamera bulundu (${backCameraIds.join(", ")})';
       });
@@ -186,24 +198,43 @@ class _MultiCamPageState extends State<MultiCamPage> {
         return;
       }
 
-      _cam1Id = pairResult['cam1Id'] as String;
-      _cam2Id = pairResult['cam2Id'] as String;
+      final cam1 = pairResult['cam1Id'] as String;
+      final cam2 = pairResult['cam2Id'] as String;
       final logicalId = pairResult['logicalId'];
 
       if (!mounted) return;
       setState(() {
         _camera2Status +=
-            ' | Mod: $mode | Pair: $_cam1Id + $_cam2Id${logicalId != null ? ' (logical=$logicalId)' : ''}';
-        _status = 'Kameralar aciliyor ($_cam1Id, $_cam2Id)...';
+            ' | Mod: $mode | Info: $cam1 + $cam2${logicalId != null ? ' (logical=$logicalId)' : ''}';
       });
 
+      // Default olarak en iyi çifti açalım
+      await _openSelectedCameras(cam1, cam2);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _status = 'Baslangic kameralari bulunamadi: $e';
+      });
+    }
+  }
+
+  Future<void> _openSelectedCameras(String cam1, String cam2) async {
+    if (!mounted) return;
+    setState(() {
+      _isReady = false;
+      _cam1Id = cam1;
+      _cam2Id = cam2;
+      _status = 'Kameralar aciliyor ($cam1, $cam2)...';
+    });
+
+    try {
+      // Önceki varsa kapat
+      await Camera2Bridge.closeDualCameras();
+
       // Step 3: Open cameras via native Camera2 API
-      final openResult = await Camera2Bridge.openDualCameras(
-        _cam1Id!,
-        _cam2Id!,
-      );
+      final openResult = await Camera2Bridge.openDualCameras(cam1, cam2);
       final success = openResult['success'] == true;
-      final openMode = openResult['mode'] ?? mode;
+      final openMode = openResult['mode'] ?? 'unknown';
 
       if (!mounted) return;
 
@@ -211,12 +242,12 @@ class _MultiCamPageState extends State<MultiCamPage> {
         final modeLabel = openMode == 'logical_multi_camera'
             ? 'Logical Multi-Camera ✓'
             : openMode == 'alternating'
-            ? 'Alternating (sirkali cekim) ✓'
+            ? 'Alternating (sirali cekim) ✓'
             : '$openMode ✓';
         setState(() {
           _isReady = true;
-          _status = 'Hazir! $_cam1Id + $_cam2Id ($modeLabel). Kaydi baslat.';
-          _camera2Status += ' | $modeLabel';
+          _status = 'Hazir! $cam1 + $cam2 ($modeLabel). Kaydi baslat.';
+          _camera2Status = _camera2Status.split('|').first + ' | $modeLabel';
         });
       } else {
         final error = openResult['error'] ?? 'Bilinmeyen hata';
@@ -228,7 +259,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
     } catch (e) {
       if (!mounted) return;
       setState(() {
-        _status = 'Dual kamera baslatma hatasi: $e';
+        _status = 'Dual kamera acilis hatasi: $e';
       });
     }
   }
@@ -326,7 +357,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
       '${sessionDir.path}${Platform.pathSeparator}capture_log.csv',
     );
     await csvFile.writeAsString(
-      'frame,timestamp_utc,cam1_image,cam2_image,fot_cm,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z\n',
+      'frame,timestamp_utc,cam1_image,cam2_image,fot_cm,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,pose_tx,pose_ty,pose_tz,pose_qx,pose_qy,pose_qz,pose_qw,fx,fy,cx,cy,k1,k2,p1,p2,k3,lux,kelvin,exposure_ms,iso,plane_data,bbox_data\n',
       flush: true,
     );
 
@@ -480,15 +511,15 @@ class _MultiCamPageState extends State<MultiCamPage> {
         final relativePath = file.path
             .substring(sessionDir.path.length + 1)
             .replaceAll(Platform.pathSeparator, '/');
-        encoder.addFile(file, relativePath);
+        await encoder.addFile(file, relativePath);
       }
 
-      encoder.closeSync();
+      await encoder.close();
     } catch (e) {
       print('ZIP Olusturma Hatasi: $e');
-      // closeSync cagrilmamissa tekrar deneyelim
+      // close cagrilmamissa tekrar deneyelim
       try {
-        encoder.closeSync();
+        await encoder.close();
       } catch (_) {}
       rethrow;
     }
@@ -553,7 +584,13 @@ class _MultiCamPageState extends State<MultiCamPage> {
       baseDir = await getApplicationDocumentsDirectory();
     }
 
-    final sessionId = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
+    final timestamp = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
+    final String modePrefix = _sessionMode == 'Kalibrasyon'
+        ? 'calib_'
+        : _sessionMode == '3D Orbit Tarama'
+        ? 'orbit_'
+        : '';
+    final sessionId = '$modePrefix$timestamp';
     final sessionDir = Directory(
       '${baseDir.path}${Platform.pathSeparator}sessions${Platform.pathSeparator}$sessionId',
     );
@@ -629,7 +666,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
 
       final fotValue = _fmt(_fotCm, digits: 3);
       final line =
-          '$frameNo,${now.toIso8601String()},${cam1Saved ? cam1Relative : ''},${cam2Saved ? cam2Relative : ''},$fotValue,${_fmt(_accX)},${_fmt(_accY)},${_fmt(_accZ)},${_fmt(_gyroX)},${_fmt(_gyroY)},${_fmt(_gyroZ)}\n';
+          '$frameNo,${now.toIso8601String()},${cam1Saved ? cam1Relative : ''},${cam2Saved ? cam2Relative : ''},$fotValue,${_fmt(_accX)},${_fmt(_accY)},${_fmt(_accZ)},${_fmt(_gyroX)},${_fmt(_gyroY)},${_fmt(_gyroZ)},${_fmt(_poseTx)},${_fmt(_poseTy)},${_fmt(_poseTz)},${_fmt(_poseQx)},${_fmt(_poseQy)},${_fmt(_poseQz)},${_fmt(_poseQw)}\n';
 
       await csvFile.writeAsString(line, mode: FileMode.append, flush: true);
     } catch (error) {
@@ -798,104 +835,246 @@ class _MultiCamPageState extends State<MultiCamPage> {
     );
   }
 
+  Widget _buildModeDropdown() {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12.0),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const Text(
+            'Çekim Modu:',
+            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(width: 12),
+          DropdownButton<String>(
+            value: _sessionMode,
+            dropdownColor: Colors.grey.shade800,
+            style: const TextStyle(
+              color: Colors.lightBlueAccent,
+              fontWeight: FontWeight.bold,
+            ),
+            items: ['Normal', 'Kalibrasyon', '3D Orbit Tarama']
+                .map((mode) => DropdownMenuItem(value: mode, child: Text(mode)))
+                .toList(),
+            onChanged: _isRecording
+                ? null
+                : (val) {
+                    if (val != null) {
+                      setState(() {
+                        _sessionMode = val;
+                      });
+                    }
+                  },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildViewModeSelector() {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12.0),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const Text(
+            'Görüntü Modu:',
+            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(width: 12),
+          DropdownButton<String>(
+            value: _viewMode,
+            dropdownColor: Colors.grey.shade800,
+            style: const TextStyle(
+              color: Colors.lightBlueAccent,
+              fontWeight: FontWeight.bold,
+            ),
+            items: ['Çift Kamera', 'Tek Kamera (Kam 1)', 'Tek Kamera (Kam 2)']
+                .map((mode) => DropdownMenuItem(value: mode, child: Text(mode)))
+                .toList(),
+            onChanged: (val) {
+              if (val != null) {
+                setState(() {
+                  _viewMode = val;
+                });
+              }
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCameraDropdowns() {
+    if (_availableBackCameraIds.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12.0),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+        children: [
+          _buildDropdown('Kamera 1:', _cam1Id, (val) {
+            if (val != null && val != _cam1Id && _cam2Id != null) {
+              _openSelectedCameras(val, _cam2Id!);
+            }
+          }),
+          _buildDropdown('Kamera 2:', _cam2Id, (val) {
+            if (val != null && val != _cam2Id && _cam1Id != null) {
+              _openSelectedCameras(_cam1Id!, val);
+            }
+          }),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDropdown(
+    String label,
+    String? currentValue,
+    ValueChanged<String?> onChanged,
+  ) {
+    final effectiveValue =
+        (currentValue != null && _availableBackCameraIds.contains(currentValue))
+        ? currentValue
+        : (_availableBackCameraIds.isNotEmpty
+              ? _availableBackCameraIds.first
+              : null);
+
+    return Row(
+      children: [
+        Text(label, style: const TextStyle(color: Colors.white70)),
+        const SizedBox(width: 8),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          decoration: BoxDecoration(
+            color: Colors.white24,
+            borderRadius: BorderRadius.circular(4),
+          ),
+          child: DropdownButton<String>(
+            value: effectiveValue,
+            dropdownColor: Colors.grey.shade800,
+            style: const TextStyle(color: Colors.white),
+            underline: const SizedBox.shrink(),
+            onChanged: _isRecording ? null : onChanged,
+            items: _availableBackCameraIds.map((id) {
+              return DropdownMenuItem(value: id, child: Text('Kamera $id'));
+            }).toList(),
+          ),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Multicam Capture (S23)')),
+      appBar: AppBar(title: const Text('Multicam Capture')),
       body: Column(
         children: [
           Expanded(
             child: Row(
               children: [
-                Expanded(
-                  child: _buildPreview(
-                    _lastCam1Frame,
-                    _cam1FrameKey,
-                    'Arka Kamera 1',
+                if (_viewMode == 'Çift Kamera' ||
+                    _viewMode == 'Tek Kamera (Kam 1)')
+                  Expanded(
+                    child: _buildPreview(
+                      _lastCam1Frame,
+                      _cam1FrameKey,
+                      'Arka Kamera 1',
+                    ),
                   ),
-                ),
-                Expanded(
-                  child: _buildPreview(
-                    _lastCam2Frame,
-                    _cam2FrameKey,
-                    'Arka Kamera 2',
+                if (_viewMode == 'Çift Kamera' ||
+                    _viewMode == 'Tek Kamera (Kam 2)')
+                  Expanded(
+                    child: _buildPreview(
+                      _lastCam2Frame,
+                      _cam2FrameKey,
+                      'Arka Kamera 2',
+                    ),
                   ),
-                ),
               ],
             ),
           ),
           _buildStatsBar(),
-          Container(
-            width: double.infinity,
-            color: Colors.black,
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(_status, style: const TextStyle(color: Colors.white)),
-                const SizedBox(height: 6),
-                Text(
-                  _camera2Status,
-                  style: const TextStyle(color: Colors.lightBlueAccent),
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  'FoT/proximity (cm): ${_fotCm?.toStringAsFixed(2) ?? '-'}',
-                  style: const TextStyle(color: Colors.white70),
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  'Acc (m/s2): ${_fmt(_accX, digits: 3)}, ${_fmt(_accY, digits: 3)}, ${_fmt(_accZ, digits: 3)}',
-                  style: const TextStyle(color: Colors.white70),
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  'Gyro (rad/s): ${_fmt(_gyroX, digits: 3)}, ${_fmt(_gyroY, digits: 3)}, ${_fmt(_gyroZ, digits: 3)}',
-                  style: const TextStyle(color: Colors.white70),
-                ),
-                const SizedBox(height: 12),
-                Text(
-                  'Yakala araligi: $_captureIntervalMs ms (${_fpsLabel(_captureIntervalMs)} FPS)',
-                  style: const TextStyle(color: Colors.white),
-                ),
-                Slider(
-                  value: _captureIntervalMs.toDouble(),
-                  min: 20,
-                  max: 2000,
-                  divisions: 18,
-                  label: '$_captureIntervalMs ms',
-                  onChanged: _onIntervalChanged,
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: _ipController,
-                  style: const TextStyle(color: Colors.black),
-                  decoration: InputDecoration(
-                    labelText: 'Hedef Bilgisayar IP (Ayni Wifi)',
-                    filled: true,
-                    fillColor: Colors.white,
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8.0),
+          Expanded(
+            child: Container(
+              width: double.infinity,
+              color: Colors.black,
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _buildModeDropdown(),
+                    _buildViewModeSelector(),
+                    _buildCameraDropdowns(),
+                    Text(_status, style: const TextStyle(color: Colors.white)),
+                    const SizedBox(height: 6),
+                    Text(
+                      _camera2Status,
+                      style: const TextStyle(color: Colors.lightBlueAccent),
                     ),
-                  ),
-                  keyboardType: const TextInputType.numberWithOptions(
-                    decimal: true,
-                  ),
-                ),
-                const SizedBox(height: 12),
-                SizedBox(
-                  width: double.infinity,
-                  child: FilledButton(
-                    onPressed: _isReady ? _toggleRecording : null,
-                    style: FilledButton.styleFrom(
-                      backgroundColor: _isRecording
-                          ? Colors.red.shade700
-                          : Colors.green.shade700,
+                    const SizedBox(height: 6),
+                    Text(
+                      'FoT/proximity (cm): ${_fotCm?.toStringAsFixed(2) ?? '-'}',
+                      style: const TextStyle(color: Colors.white70),
                     ),
-                    child: Text(_isRecording ? 'Kaydi Durdur' : 'Kaydi Baslat'),
-                  ),
+                    const SizedBox(height: 6),
+                    Text(
+                      'Acc (m/s2): ${_fmt(_accX, digits: 3)}, ${_fmt(_accY, digits: 3)}, ${_fmt(_accZ, digits: 3)}',
+                      style: const TextStyle(color: Colors.white70),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      'Gyro (rad/s): ${_fmt(_gyroX, digits: 3)}, ${_fmt(_gyroY, digits: 3)}, ${_fmt(_gyroZ, digits: 3)}',
+                      style: const TextStyle(color: Colors.white70),
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      'Yakala araligi: $_captureIntervalMs ms (${_fpsLabel(_captureIntervalMs)} FPS)',
+                      style: const TextStyle(color: Colors.white),
+                    ),
+                    Slider(
+                      value: _captureIntervalMs.toDouble(),
+                      min: 20,
+                      max: 2000,
+                      divisions: 18,
+                      label: '$_captureIntervalMs ms',
+                      onChanged: _onIntervalChanged,
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: _ipController,
+                      style: const TextStyle(color: Colors.black),
+                      decoration: InputDecoration(
+                        labelText: 'Hedef Bilgisayar IP (Ayni Wifi)',
+                        filled: true,
+                        fillColor: Colors.white,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(8.0),
+                        ),
+                      ),
+                      keyboardType: const TextInputType.numberWithOptions(
+                        decimal: true,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    SizedBox(
+                      width: double.infinity,
+                      child: FilledButton(
+                        onPressed: _isReady ? _toggleRecording : null,
+                        style: FilledButton.styleFrom(
+                          backgroundColor: _isRecording
+                              ? Colors.red.shade700
+                              : Colors.green.shade700,
+                        ),
+                        child: Text(
+                          _isRecording ? 'Kaydi Durdur' : 'Kaydi Baslat',
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
-              ],
+              ),
             ),
           ),
         ],

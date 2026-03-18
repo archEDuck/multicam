@@ -31,8 +31,8 @@ import java.util.concurrent.TimeUnit
 class DualCameraManager(private val context: Context) {
     companion object {
         private const val TAG = "DualCameraManager"
-        private const val IMAGE_WIDTH = 640
-        private const val IMAGE_HEIGHT = 480
+        private const val IMAGE_WIDTH = 1920
+        private const val IMAGE_HEIGHT = 1080
         private const val OPEN_TIMEOUT_MS = 5000L
         private const val CAPTURE_TIMEOUT_MS = 3000L
     }
@@ -309,6 +309,12 @@ class DualCameraManager(private val context: Context) {
                 addTarget(reader1!!.surface)
                 addTarget(reader2!!.surface)
                 set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)
+                set(CaptureRequest.JPEG_QUALITY, 100.toByte())
+                set(CaptureRequest.JPEG_ORIENTATION, 90)
             }.build()
 
             logicalSession!!.setRepeatingRequest(previewRequest, null, backgroundHandler)
@@ -465,9 +471,13 @@ class DualCameraManager(private val context: Context) {
             // Fire a few preview frames first to warm up AE/AF
             val previewRequest = device!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                 addTarget(reader.surface)
+                set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
             }.build()
             session!!.setRepeatingRequest(previewRequest, null, backgroundHandler)
-            Thread.sleep(300) // Let AE/AF converge
+            Thread.sleep(800) // Let AE/AF converge thoroughly
             session!!.stopRepeating()
 
             // Now take the actual still capture
@@ -494,7 +504,11 @@ class DualCameraManager(private val context: Context) {
 
             val stillRequest = device!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(reader.surface)
-                set(CaptureRequest.JPEG_QUALITY, 80.toByte())
+                set(CaptureRequest.JPEG_QUALITY, 100.toByte())
+                set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)
+                set(CaptureRequest.JPEG_ORIENTATION, 90)
             }.build()
 
             session!!.capture(stillRequest, null, backgroundHandler)
@@ -567,6 +581,16 @@ class DualCameraManager(private val context: Context) {
     }
 
     private fun getBackCameraIds(): List<String> {
-        return cameraManager.cameraIdList.filter { isBackCamera(it) }
+        val allIdsToInspect = mutableSetOf<String>()
+        for (id in cameraManager.cameraIdList) {
+            allIdsToInspect.add(id)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                try {
+                    val characteristics = cameraManager.getCameraCharacteristics(id)
+                    allIdsToInspect.addAll(characteristics.physicalCameraIds)
+                } catch (e: Exception) {}
+            }
+        }
+        return allIdsToInspect.filter { isBackCamera(it) }
     }
 }
