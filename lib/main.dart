@@ -668,7 +668,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
 
       final fotValue = _fmt(_fotCm, digits: 3);
 
-      // Extract extra sensor/camera metadata if provided from Native/ARCore bridge
+      // Extract extra sensor/camera metadata
       final fx = result['fx'] ?? '';
       final fy = result['fy'] ?? '';
       final cx = result['cx'] ?? '';

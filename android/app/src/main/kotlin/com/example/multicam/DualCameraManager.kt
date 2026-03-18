@@ -553,7 +553,7 @@ class DualCameraManager(private val context: Context) {
         result["lux"] = latestLux
         // Estimated from COLOR_CORRECTION_GAINS
         result["kelvin"] = latestKelvin
-        // Mocked or external values from ARCore if not available natively here
+        // Mocked or external values if not available natively here
         result["plane_data"] = ""
         result["bbox_data"] = ""
         result["cam1Id"] = physicalId1 ?: altCam1Id ?: ""
