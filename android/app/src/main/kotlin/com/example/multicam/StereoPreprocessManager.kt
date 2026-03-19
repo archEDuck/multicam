@@ -468,22 +468,19 @@ class StereoPreprocessManager(private val context: Context) {
                     )
                 }
 
-                val leftTensor = buildRgbInputTensor(
-                    env = runtime.env,
-                    sourceBgr = rect1,
-                    width = runtime.leftInput.width,
-                    height = runtime.leftInput.height,
-                )
-                val rightTensor = buildRgbInputTensor(
-                    env = runtime.env,
-                    sourceBgr = rect2,
-                    width = runtime.rightInput.width,
-                    height = runtime.rightInput.height,
-                )
-
                 val modelInputs = hashMapOf<String, OnnxTensor>(
-                    runtime.leftInput.name to leftTensor,
-                    runtime.rightInput.name to rightTensor,
+                    runtime.leftInput.name to buildRgbInputTensor(
+                        env = runtime.env,
+                        sourceBgr = rect1,
+                        width = runtime.leftInput.width,
+                        height = runtime.leftInput.height,
+                    ),
+                    runtime.rightInput.name to buildRgbInputTensor(
+                        env = runtime.env,
+                        sourceBgr = rect2,
+                        width = runtime.rightInput.width,
+                        height = runtime.rightInput.height,
+                    ),
                 )
 
                 val inferenceStartNs = System.nanoTime()
@@ -492,8 +489,10 @@ class StereoPreprocessManager(private val context: Context) {
                         readModelOutputDisparity(outputs, runtime.output)
                     }
                 } finally {
-                    leftTensor.close()
-                    rightTensor.close()
+                    modelInputs.values.forEach { tensor ->
+                        runCatching { tensor.close() }
+                    }
+                    modelInputs.clear()
                 }
                 val inferenceMs = ((System.nanoTime() - inferenceStartNs).toDouble() / 1_000_000.0)
 
