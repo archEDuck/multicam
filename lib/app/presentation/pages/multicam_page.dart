@@ -1389,7 +1389,11 @@ class _MultiCamPageState extends State<MultiCamPage> {
       _isStereoProcessing = false;
       _showDepthPreview = hasDepthPreview;
       _depthPreviewBytes = hasDepthPreview ? depthBytes : null;
-      _stereoStatus = hasDepthPreview ? '' : '✗ ${result.message}';
+      _stereoStatus = hasDepthPreview
+          ? (result.message.trim().isNotEmpty
+                ? '✓ ${result.message}'
+                : '✓ AI derinlik aktif.')
+          : '✗ ${result.message}';
     });
   }
 

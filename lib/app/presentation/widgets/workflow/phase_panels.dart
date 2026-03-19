@@ -404,7 +404,7 @@ class DepthMapPhasePanel extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         const Text(
-          'Stereo görüntü işleme ile canlı derinlik haritası üretilir.',
+          'AI stereo modeli ile canlı derinlik haritası üretilir.',
           style: TextStyle(color: Colors.white70),
         ),
         const SizedBox(height: 6),

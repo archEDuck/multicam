@@ -1,13 +1,16 @@
 package com.example.multicam
 
+import ai.onnxruntime.OnnxJavaType
+import ai.onnxruntime.OnnxTensor
+import ai.onnxruntime.OrtEnvironment
+import ai.onnxruntime.OrtSession
+import ai.onnxruntime.TensorInfo
 import android.content.Context
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import org.opencv.android.OpenCVLoader
 import org.opencv.calib3d.Calib3d
-import org.opencv.calib3d.StereoBM
-import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.MatOfByte
@@ -21,6 +24,7 @@ import org.opencv.core.TermCriteria
 import org.opencv.imgcodecs.Imgcodecs
 import org.opencv.imgproc.Imgproc
 import java.io.File
+import java.nio.FloatBuffer
 import java.util.Locale
 
 class StereoPreprocessManager(private val context: Context) {
@@ -37,10 +41,13 @@ class StereoPreprocessManager(private val context: Context) {
 
         private const val MIN_VALID_PAIRS = 5
         private const val CALIBRATION_FILE_NAME = "stereo_calibration.json"
-        private const val DEPTH_DOWNSCALE = 0.5
-        private const val DEPTH_BLOCK_SIZE = 15
-        private const val DEPTH_TARGET_NUM_DISPARITIES = 96
         private const val DEPTH_JPEG_QUALITY = 72
+        private const val DEPTH_MODEL_ASSET_PATH =
+            "flutter_assets/assets/foundation_stereo_cleaned_fp32.onnx"
+        private const val DEPTH_MODEL_ASSET_FALLBACK =
+            "assets/foundation_stereo_cleaned_fp32.onnx"
+        private const val DEPTH_MODEL_DIRECT_ASSET =
+            "foundation_stereo_cleaned_fp32.onnx"
     }
 
     private data class CheckerboardSpec(
@@ -81,9 +88,30 @@ class StereoPreprocessManager(private val context: Context) {
         val calibrationLastModifiedMs: Long,
     )
 
+    private data class DepthInputTensorSpec(
+        val name: String,
+        val width: Int,
+        val height: Int,
+    )
+
+    private data class DepthOutputTensorSpec(
+        val index: Int,
+        val name: String,
+        val width: Int,
+        val height: Int,
+    )
+
+    private data class DepthModelRuntime(
+        val env: OrtEnvironment,
+        val session: OrtSession,
+        val leftInput: DepthInputTensorSpec,
+        val rightInput: DepthInputTensorSpec,
+        val output: DepthOutputTensorSpec,
+        val backendLabel: String,
+    )
+
     private var cachedRectifyMaps: RectifyMaps? = null
-    private var cachedStereoBm: StereoBM? = null
-    private var cachedStereoBmNumDisparities: Int = -1
+    private var cachedDepthModelRuntime: DepthModelRuntime? = null
 
     fun checkCheckerboard(cam1Path: String, cam2Path: String): Map<String, Any> {
         return try {
@@ -377,71 +405,78 @@ class StereoPreprocessManager(private val context: Context) {
             Imgproc.remap(src1, rect1, rectifyMaps.map1x, rectifyMaps.map1y, Imgproc.INTER_LINEAR)
             Imgproc.remap(src2, rect2, rectifyMaps.map2x, rectifyMaps.map2y, Imgproc.INTER_LINEAR)
 
-            val gray1 = Mat()
-            val gray2 = Mat()
-            Imgproc.cvtColor(rect1, gray1, Imgproc.COLOR_BGR2GRAY)
-            Imgproc.cvtColor(rect2, gray2, Imgproc.COLOR_BGR2GRAY)
-
-            val depthSize = depthProcessingSize(rectifyMaps.imageSize)
-            val smallGray1 = Mat()
-            val smallGray2 = Mat()
-            Imgproc.resize(gray1, smallGray1, depthSize, 0.0, 0.0, Imgproc.INTER_AREA)
-            Imgproc.resize(gray2, smallGray2, depthSize, 0.0, 0.0, Imgproc.INTER_AREA)
-
-            val disparity16 = Mat()
-            val stereoBm = getOrCreateStereoBm(smallGray1.cols())
-            stereoBm.compute(smallGray1, smallGray2, disparity16)
-
-            val disparity32 = Mat()
-            disparity16.convertTo(disparity32, CvType.CV_32F, 1.0 / 16.0)
-            Imgproc.threshold(disparity32, disparity32, 0.0, 0.0, Imgproc.THRESH_TOZERO)
-
-            val disparity8 = Mat()
-            Core.normalize(disparity32, disparity8, 0.0, 255.0, Core.NORM_MINMAX, CvType.CV_8U)
-
-            val depthColor = Mat()
-            Imgproc.applyColorMap(disparity8, depthColor, Imgproc.COLORMAP_TURBO)
-            if (depthColor.size() != rectifyMaps.imageSize) {
-                Imgproc.resize(depthColor, depthColor, rectifyMaps.imageSize, 0.0, 0.0, Imgproc.INTER_LINEAR)
-            }
-
-            val outDepth = MatOfByte()
-            val encodeParams = MatOfInt(Imgcodecs.IMWRITE_JPEG_QUALITY, DEPTH_JPEG_QUALITY)
-            val ok = Imgcodecs.imencode(".jpg", depthColor, outDepth, encodeParams)
-            val depthBytes = if (ok) outDepth.toArray() else ByteArray(0)
-
-            outDepth.release()
-            encodeParams.release()
-            src1.release()
-            src2.release()
-            rect1.release()
-            rect2.release()
-            gray1.release()
-            gray2.release()
-            smallGray1.release()
-            smallGray2.release()
-            disparity16.release()
-            disparity32.release()
-            disparity8.release()
-            depthColor.release()
-
-            if (!ok || depthBytes.isEmpty()) {
+            val runtime = getOrCreateDepthModelRuntime()
+            if (
+                runtime.leftInput.width != runtime.rightInput.width ||
+                    runtime.leftInput.height != runtime.rightInput.height
+            ) {
+                src1.release()
+                src2.release()
+                rect1.release()
+                rect2.release()
                 return mapOf(
                     "success" to false,
-                    "message" to "Canlı derinlik çıktısı üretilemedi.",
+                    "message" to "Model giriş tensor boyutları eşleşmiyor.",
                     "processedPairs" to 0,
                     "outputPath" to calibrationFile.absolutePath,
                 )
             }
 
+            val leftTensor = buildRgbInputTensor(
+                env = runtime.env,
+                sourceBgr = rect1,
+                width = runtime.leftInput.width,
+                height = runtime.leftInput.height,
+            )
+            val rightTensor = buildRgbInputTensor(
+                env = runtime.env,
+                sourceBgr = rect2,
+                width = runtime.rightInput.width,
+                height = runtime.rightInput.height,
+            )
+
+            val modelInputs = hashMapOf<String, OnnxTensor>(
+                runtime.leftInput.name to leftTensor,
+                runtime.rightInput.name to rightTensor,
+            )
+
+            val disparityValues: FloatArray = try {
+                runtime.session.run(modelInputs).use { outputs ->
+                    val outputValue = outputs[runtime.output.index]
+                    flattenNumericTensor(outputValue.value)
+                        ?: throw IllegalStateException("Model çıktısı numerik tensor olarak okunamadı.")
+                }
+            } finally {
+                leftTensor.close()
+                rightTensor.close()
+            }
+
+            val depthBytes = disparityToDepthJpeg(
+                disparityValues = disparityValues,
+                outputWidth = runtime.output.width,
+                outputHeight = runtime.output.height,
+                targetSize = rectifyMaps.imageSize,
+            )
+
+            src1.release()
+            src2.release()
+            rect1.release()
+            rect2.release()
+
             mapOf(
                 "success" to true,
-                "message" to "Canlı derinlik aktif.",
+                "message" to "Canlı derinlik aktif (AI ${runtime.backendLabel}).",
                 "processedPairs" to 1,
                 "outputPath" to calibrationFile.absolutePath,
                 "depthBytes" to depthBytes,
                 "imageWidth" to rectifyMaps.imageSize.width.toInt(),
                 "imageHeight" to rectifyMaps.imageSize.height.toInt(),
+                "backend" to runtime.backendLabel,
+                "modelInputWidth" to runtime.leftInput.width,
+                "modelInputHeight" to runtime.leftInput.height,
+                "modelOutputName" to runtime.output.name,
+                "modelOutputWidth" to runtime.output.width,
+                "modelOutputHeight" to runtime.output.height,
             )
         } catch (e: Exception) {
             Log.e(TAG, "Live depth map failed", e)
@@ -863,31 +898,323 @@ class StereoPreprocessManager(private val context: Context) {
         maps?.map2y?.release()
     }
 
-    private fun depthProcessingSize(sourceSize: Size): Size {
-        val scaledWidth = (sourceSize.width * DEPTH_DOWNSCALE).toInt().coerceAtLeast(160)
-        val scaledHeight = (sourceSize.height * DEPTH_DOWNSCALE).toInt().coerceAtLeast(120)
-        return Size(scaledWidth.toDouble(), scaledHeight.toDouble())
-    }
+    private fun getOrCreateDepthModelRuntime(): DepthModelRuntime {
+        cachedDepthModelRuntime?.let { return it }
 
-    private fun getOrCreateStereoBm(imageWidth: Int): StereoBM {
-        val maxByWidth = ((imageWidth / 16) * 16).coerceAtLeast(16)
-        val numDisparities = minOf(DEPTH_TARGET_NUM_DISPARITIES, maxByWidth)
+        val env = OrtEnvironment.getEnvironment()
+        val modelBytes = loadDepthModelBytes()
+        val (session, backendLabel) = createDepthSession(env, modelBytes)
 
-        if (cachedStereoBm != null && cachedStereoBmNumDisparities == numDisparities) {
-            return checkNotNull(cachedStereoBm)
+        val (leftInput, rightInput) = resolveModelInputSpecs(session)
+        if (leftInput.width != rightInput.width || leftInput.height != rightInput.height) {
+            session.close()
+            throw IllegalStateException(
+                "Model sol/sağ girişleri aynı çözünürlükte olmalı: " +
+                    "left=${leftInput.width}x${leftInput.height}, " +
+                    "right=${rightInput.width}x${rightInput.height}",
+            )
         }
 
-        val stereoBm = StereoBM.create(numDisparities, DEPTH_BLOCK_SIZE)
-        stereoBm.setPreFilterCap(31)
-        stereoBm.setTextureThreshold(8)
-        stereoBm.setUniquenessRatio(12)
-        stereoBm.setSpeckleWindowSize(80)
-        stereoBm.setSpeckleRange(16)
-        stereoBm.setDisp12MaxDiff(1)
+        val output = selectDepthOutputSpec(session)
+        val runtime = DepthModelRuntime(
+            env = env,
+            session = session,
+            leftInput = leftInput,
+            rightInput = rightInput,
+            output = output,
+            backendLabel = backendLabel,
+        )
+        cachedDepthModelRuntime = runtime
 
-        cachedStereoBm = stereoBm
-        cachedStereoBmNumDisparities = numDisparities
-        return stereoBm
+        Log.i(
+            TAG,
+            "Depth model hazır: backend=$backendLabel, " +
+                "input=${leftInput.width}x${leftInput.height}, " +
+                "output=${output.name}:${output.width}x${output.height}",
+        )
+
+        return runtime
+    }
+
+    private fun createDepthSession(
+        env: OrtEnvironment,
+        modelBytes: ByteArray,
+    ): Pair<OrtSession, String> {
+        try {
+            val nnapiOptions = OrtSession.SessionOptions()
+            try {
+                nnapiOptions.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+                nnapiOptions.setIntraOpNumThreads(2)
+                nnapiOptions.setInterOpNumThreads(1)
+                nnapiOptions.addNnapi()
+                val session = env.createSession(modelBytes, nnapiOptions)
+                return session to "NNAPI"
+            } finally {
+                nnapiOptions.close()
+            }
+        } catch (nnapiError: Exception) {
+            Log.w(TAG, "NNAPI backend açılamadı, CPU fallback kullanılacak.", nnapiError)
+        }
+
+        val cpuOptions = OrtSession.SessionOptions()
+        try {
+            cpuOptions.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+            cpuOptions.setIntraOpNumThreads(4)
+            cpuOptions.setInterOpNumThreads(1)
+            val cpuSession = env.createSession(modelBytes, cpuOptions)
+            return cpuSession to "CPU"
+        } finally {
+            cpuOptions.close()
+        }
+    }
+
+    private fun resolveModelInputSpecs(session: OrtSession): Pair<DepthInputTensorSpec, DepthInputTensorSpec> {
+        val namedLeft = resolveInputTensorSpec(session, "left_image")
+        val namedRight = resolveInputTensorSpec(session, "right_image")
+        if (namedLeft != null && namedRight != null) {
+            return namedLeft to namedRight
+        }
+
+        val candidates = session.inputInfo.entries.mapNotNull { (name, nodeInfo) ->
+            val tensorInfo = nodeInfo.info as? TensorInfo ?: return@mapNotNull null
+            if (tensorInfo.type != OnnxJavaType.FLOAT) return@mapNotNull null
+            val shape = tensorInfo.shape
+            if (shape.size != 4) return@mapNotNull null
+
+            val height = toPositiveIntDimension(shape[2]) ?: return@mapNotNull null
+            val width = toPositiveIntDimension(shape[3]) ?: return@mapNotNull null
+            DepthInputTensorSpec(name = name, width = width, height = height)
+        }
+
+        if (candidates.size < 2) {
+            throw IllegalStateException(
+                "Model en az iki adet float 4D giriş tensoru bekliyor.",
+            )
+        }
+
+        val left = candidates.first()
+        val right = candidates.firstOrNull {
+            it.name != left.name && it.width == left.width && it.height == left.height
+        } ?: candidates[1]
+
+        return left to right
+    }
+
+    private fun resolveInputTensorSpec(
+        session: OrtSession,
+        inputName: String,
+    ): DepthInputTensorSpec? {
+        val nodeInfo = session.inputInfo[inputName] ?: return null
+        val tensorInfo = nodeInfo.info as? TensorInfo ?: return null
+        if (tensorInfo.type != OnnxJavaType.FLOAT) return null
+        val shape = tensorInfo.shape
+        if (shape.size != 4) return null
+
+        val height = toPositiveIntDimension(shape[2]) ?: return null
+        val width = toPositiveIntDimension(shape[3]) ?: return null
+
+        return DepthInputTensorSpec(name = inputName, width = width, height = height)
+    }
+
+    private fun selectDepthOutputSpec(session: OrtSession): DepthOutputTensorSpec {
+        val candidates = session.outputInfo.entries.mapIndexedNotNull { index, (name, nodeInfo) ->
+            val tensorInfo = nodeInfo.info as? TensorInfo ?: return@mapIndexedNotNull null
+            if (tensorInfo.type != OnnxJavaType.FLOAT) return@mapIndexedNotNull null
+            val shape = tensorInfo.shape
+            if (shape.size < 2) return@mapIndexedNotNull null
+
+            val height = toPositiveIntDimension(shape[shape.size - 2]) ?: return@mapIndexedNotNull null
+            val width = toPositiveIntDimension(shape[shape.size - 1]) ?: return@mapIndexedNotNull null
+            DepthOutputTensorSpec(
+                index = index,
+                name = name,
+                width = width,
+                height = height,
+            )
+        }
+
+        val preferred = candidates.firstOrNull { it.name.equals("disparity_map", ignoreCase = true) }
+        if (preferred != null) {
+            return preferred
+        }
+
+        return candidates.firstOrNull()
+            ?: throw IllegalStateException("Modelde uygun float çıkış tensoru bulunamadı.")
+    }
+
+    private fun toPositiveIntDimension(value: Long): Int? {
+        if (value <= 0L || value > Int.MAX_VALUE.toLong()) {
+            return null
+        }
+        return value.toInt()
+    }
+
+    private fun buildRgbInputTensor(
+        env: OrtEnvironment,
+        sourceBgr: Mat,
+        width: Int,
+        height: Int,
+    ): OnnxTensor {
+        val resized = Mat()
+        val rgb = Mat()
+        try {
+            Imgproc.resize(
+                sourceBgr,
+                resized,
+                Size(width.toDouble(), height.toDouble()),
+                0.0,
+                0.0,
+                Imgproc.INTER_AREA,
+            )
+            Imgproc.cvtColor(resized, rgb, Imgproc.COLOR_BGR2RGB)
+            val nchw = matToNormalizedRgbNchw(rgb, width, height)
+            val tensorShape = longArrayOf(1L, 3L, height.toLong(), width.toLong())
+            return OnnxTensor.createTensor(env, FloatBuffer.wrap(nchw), tensorShape)
+        } finally {
+            resized.release()
+            rgb.release()
+        }
+    }
+
+    private fun matToNormalizedRgbNchw(
+        rgbMat: Mat,
+        width: Int,
+        height: Int,
+    ): FloatArray {
+        val pixelCount = width * height
+        val interleaved = ByteArray(pixelCount * 3)
+        rgbMat.get(0, 0, interleaved)
+
+        val nchw = FloatArray(pixelCount * 3)
+        var srcIndex = 0
+
+        for (pixelIndex in 0 until pixelCount) {
+            val r = interleaved[srcIndex++].toInt() and 0xFF
+            val g = interleaved[srcIndex++].toInt() and 0xFF
+            val b = interleaved[srcIndex++].toInt() and 0xFF
+
+            nchw[pixelIndex] = r / 255f
+            nchw[pixelIndex + pixelCount] = g / 255f
+            nchw[pixelIndex + (pixelCount * 2)] = b / 255f
+        }
+
+        return nchw
+    }
+
+    private fun flattenNumericTensor(raw: Any?): FloatArray? {
+        if (raw == null) return null
+
+        val output = ArrayList<Float>()
+
+        fun visit(value: Any?) {
+            when (value) {
+                null -> Unit
+                is Float -> output.add(value)
+                is Double -> output.add(value.toFloat())
+                is Number -> output.add(value.toFloat())
+                is FloatArray -> value.forEach { output.add(it) }
+                is DoubleArray -> value.forEach { output.add(it.toFloat()) }
+                is IntArray -> value.forEach { output.add(it.toFloat()) }
+                is LongArray -> value.forEach { output.add(it.toFloat()) }
+                is Array<*> -> value.forEach { visit(it) }
+                else -> Unit
+            }
+        }
+
+        visit(raw)
+        if (output.isEmpty()) return null
+        return output.toFloatArray()
+    }
+
+    private fun disparityToDepthJpeg(
+        disparityValues: FloatArray,
+        outputWidth: Int,
+        outputHeight: Int,
+        targetSize: Size,
+    ): ByteArray {
+        val expected = outputWidth * outputHeight
+        if (disparityValues.size < expected) {
+            throw IllegalStateException(
+                "Model çıktısı beklenenden küçük: ${disparityValues.size} < $expected",
+            )
+        }
+
+        var minVal = Float.POSITIVE_INFINITY
+        var maxVal = Float.NEGATIVE_INFINITY
+        for (index in 0 until expected) {
+            val value = disparityValues[index]
+            if (!value.isFinite()) continue
+            if (value < minVal) minVal = value
+            if (value > maxVal) maxVal = value
+        }
+
+        if (!minVal.isFinite() || !maxVal.isFinite()) {
+            throw IllegalStateException("Model çıktısı geçerli disparity değeri içermiyor.")
+        }
+
+        val normalized = ByteArray(expected)
+        val range = (maxVal - minVal).coerceAtLeast(1e-6f)
+        for (index in 0 until expected) {
+            val value = disparityValues[index]
+            val scaled = if (!value.isFinite()) {
+                0
+            } else {
+                (((value - minVal) / range) * 255f).toInt().coerceIn(0, 255)
+            }
+            normalized[index] = scaled.toByte()
+        }
+
+        val disparity8 = Mat(outputHeight, outputWidth, CvType.CV_8U)
+        val depthColor = Mat()
+        val outDepth = MatOfByte()
+        val encodeParams = MatOfInt(Imgcodecs.IMWRITE_JPEG_QUALITY, DEPTH_JPEG_QUALITY)
+
+        try {
+            disparity8.put(0, 0, normalized)
+            Imgproc.applyColorMap(disparity8, depthColor, Imgproc.COLORMAP_TURBO)
+            if (depthColor.size() != targetSize) {
+                Imgproc.resize(depthColor, depthColor, targetSize, 0.0, 0.0, Imgproc.INTER_LINEAR)
+            }
+
+            val encoded = Imgcodecs.imencode(".jpg", depthColor, outDepth, encodeParams)
+            if (!encoded) {
+                throw IllegalStateException("Derinlik JPEG encode başarısız.")
+            }
+
+            val depthBytes = outDepth.toArray()
+            if (depthBytes.isEmpty()) {
+                throw IllegalStateException("Derinlik JPEG çıktısı boş.")
+            }
+            return depthBytes
+        } finally {
+            disparity8.release()
+            depthColor.release()
+            outDepth.release()
+            encodeParams.release()
+        }
+    }
+
+    private fun loadDepthModelBytes(): ByteArray {
+        val candidates = listOf(
+            DEPTH_MODEL_ASSET_PATH,
+            DEPTH_MODEL_ASSET_FALLBACK,
+            DEPTH_MODEL_DIRECT_ASSET,
+        )
+
+        for (candidate in candidates) {
+            try {
+                context.assets.open(candidate).use { input ->
+                    return input.readBytes()
+                }
+            } catch (_: Exception) {
+                // try next candidate
+            }
+        }
+
+        throw IllegalStateException(
+            "Derinlik modeli asset bulunamadı. pubspec.yaml içinde " +
+                "assets/foundation_stereo_cleaned_fp32.onnx tanımlı olmalı.",
+        )
     }
 
     private fun checkerboardSpecs(): List<CheckerboardSpec> {
