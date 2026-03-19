@@ -29,6 +29,7 @@ class MainActivity : FlutterActivity() {
 	private val dualCameraChannel = "multicam/dual_camera"
 	private val systemStatsChannel = "multicam/system_stats"
 	private val stereoPreprocessChannel = "multicam/stereo_preprocess"
+	private val sam2Channel = "multicam/sam2"
 
 	override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
 		super.configureFlutterEngine(flutterEngine)
@@ -47,6 +48,9 @@ class MainActivity : FlutterActivity() {
 
 		MethodChannel(flutterEngine.dartExecutor.binaryMessenger, stereoPreprocessChannel)
 			.setMethodCallHandler(StereoPreprocessHandler(this))
+
+		MethodChannel(flutterEngine.dartExecutor.binaryMessenger, sam2Channel)
+			.setMethodCallHandler(Sam2Handler(this))
 	}
 }
 
@@ -210,6 +214,53 @@ private class StereoPreprocessHandler(
 				}
 				runOnBackground(result) {
 					manager.depthFramePair(cam1Bytes, cam2Bytes)
+				}
+			}
+
+			else -> result.notImplemented()
+		}
+	}
+}
+
+private class Sam2Handler(
+	context: Context,
+) : MethodChannel.MethodCallHandler {
+	private val manager = Sam2Manager(context)
+	private val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+	private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+	private fun runOnBackground(result: MethodChannel.Result, block: () -> Any?) {
+		executor.execute {
+			try {
+				val value = block()
+				mainHandler.post { result.success(value) }
+			} catch (e: Exception) {
+				mainHandler.post { result.error("SAM2_ERROR", e.message, null) }
+			}
+		}
+	}
+
+	override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
+		when (call.method) {
+			"getSam2Status" -> {
+				runOnBackground(result) {
+					manager.getStatus()
+				}
+			}
+
+			"segmentFrame" -> {
+				val imageBytes = call.argument<ByteArray>("imageBytes")
+				val points = call.argument<List<Map<String, Any?>>>("points")
+				if (imageBytes == null || imageBytes.isEmpty()) {
+					result.error("INVALID_ARGS", "imageBytes is required", null)
+					return
+				}
+				if (points == null || points.isEmpty()) {
+					result.error("INVALID_ARGS", "points are required", null)
+					return
+				}
+				runOnBackground(result) {
+					manager.segmentFrame(imageBytes, points)
 				}
 			}
 

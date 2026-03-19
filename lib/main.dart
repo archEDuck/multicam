@@ -12,20 +12,27 @@ import 'app/application/usecases/calibrate_stereo_session_use_case.dart';
 import 'app/application/usecases/check_checkerboard_frame_pair_use_case.dart';
 import 'app/application/usecases/build_depth_map_frame_pair_use_case.dart';
 import 'app/application/usecases/get_calibration_status_use_case.dart';
+import 'app/application/usecases/get_sam2_availability_use_case.dart';
 import 'app/application/usecases/get_system_stats_use_case.dart';
 import 'app/application/usecases/load_app_settings_use_case.dart';
 import 'app/application/usecases/rectify_preview_frame_pair_use_case.dart';
 import 'app/application/usecases/save_app_settings_use_case.dart';
+import 'app/application/usecases/segment_sam2_frame_use_case.dart';
 import 'app/application/usecases/warm_up_system_stats_use_case.dart';
 import 'app/domain/entities/app_settings.dart';
 import 'app/domain/entities/capture_workflow_phase.dart';
+import 'app/domain/entities/sam2_point.dart';
 import 'app/domain/entities/stereo_preprocess_result.dart';
 import 'app/domain/entities/system_stats.dart';
 import 'app/infrastructure/repositories/json_app_settings_repository.dart';
+import 'app/infrastructure/repositories/method_channel_sam2_repository.dart';
 import 'app/infrastructure/repositories/method_channel_stereo_preprocess_repository.dart';
 import 'app/infrastructure/repositories/method_channel_system_stats_repository.dart';
+import 'app/presentation/controllers/sam2_segmentation_controller.dart';
+import 'app/presentation/controllers/sam2_segmentation_state.dart';
 import 'app/presentation/controllers/settings_controller.dart';
 import 'app/presentation/widgets/multicam_stats_bar.dart';
+import 'app/presentation/widgets/sam2_control_panel.dart';
 import 'camera2_bridge.dart';
 
 Future<void> main() async {
@@ -111,11 +118,15 @@ class _MultiCamPageState extends State<MultiCamPage> {
   static const int _defaultRequiredCalibrationPairs = 5;
   static const int _minRequiredCalibrationPairs = 3;
   static const int _maxRequiredCalibrationPairs = 20;
+  static const double _previewAspectRatio = 16 / 9;
+  static const double _previewImageWidth = 1920;
+  static const double _previewImageHeight = 1080;
   static const Duration _nextAngleDelay = Duration(milliseconds: 1500);
   static const Duration _liveRectifyMinInterval = Duration(milliseconds: 120);
   static const Duration _liveDepthMinInterval = Duration(milliseconds: 220);
 
   late final SettingsController _settingsController;
+  late final Sam2SegmentationController _sam2Controller;
   late final WarmUpSystemStatsUseCase _warmUpSystemStatsUseCase;
   late final GetSystemStatsUseCase _getSystemStatsUseCase;
   late final GetCalibrationStatusUseCase _getCalibrationStatusUseCase;
@@ -188,6 +199,9 @@ class _MultiCamPageState extends State<MultiCamPage> {
   List<Offset> _cam2CheckerboardCorners = const [];
   bool _checkerboardFoundCam1 = false;
   bool _checkerboardFoundCam2 = false;
+  Uint8List? _sam2FrozenPreviewBytes;
+  Sam2PreviewTarget? _sam2FrozenTarget;
+  String? _lastSam2OutputPath;
 
   String? _activeCam1Id;
   String? _activeCam2Id;
@@ -223,7 +237,10 @@ class _MultiCamPageState extends State<MultiCamPage> {
     _getSystemStatsUseCase = GetSystemStatsUseCase(statsRepository);
 
     final stereoRepository = MethodChannelStereoPreprocessRepository();
-    _getCalibrationStatusUseCase = GetCalibrationStatusUseCase(stereoRepository);
+    final sam2Repository = MethodChannelSam2Repository();
+    _getCalibrationStatusUseCase = GetCalibrationStatusUseCase(
+      stereoRepository,
+    );
     _calibrateStereoSessionUseCase = CalibrateStereoSessionUseCase(
       stereoRepository,
     );
@@ -236,6 +253,10 @@ class _MultiCamPageState extends State<MultiCamPage> {
     _checkCheckerboardFramePairUseCase = CheckCheckerboardFramePairUseCase(
       stereoRepository,
     );
+    _sam2Controller = Sam2SegmentationController(
+      getAvailabilityUseCase: GetSam2AvailabilityUseCase(sam2Repository),
+      segmentFrameUseCase: SegmentSam2FrameUseCase(sam2Repository),
+    )..addListener(_onSam2StateChanged);
 
     _initialize();
   }
@@ -251,6 +272,9 @@ class _MultiCamPageState extends State<MultiCamPage> {
 
     unawaited(_settingsController.flushNow());
     _settingsController.dispose();
+    _sam2Controller
+      ..removeListener(_onSam2StateChanged)
+      ..dispose();
 
     Camera2Bridge.closeDualCameras().catchError((_) {});
     super.dispose();
@@ -281,6 +305,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
       await _initDualCameras();
       await _refreshCalibrationCacheStatus();
       _applySensorSettings();
+      unawaited(_sam2Controller.loadAvailability());
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -295,6 +320,198 @@ class _MultiCamPageState extends State<MultiCamPage> {
     setState(() {
       _settings = loaded;
     });
+  }
+
+  void _onSam2StateChanged() {
+    if (!mounted) return;
+    setState(() {});
+  }
+
+  void _resetSam2Overlay() {
+    _sam2FrozenPreviewBytes = null;
+    _sam2FrozenTarget = null;
+  }
+
+  void _clearSam2Selection() {
+    _resetSam2Overlay();
+    _sam2Controller.clearSelection();
+  }
+
+  Future<void> _saveSam2Overlay() async {
+    final overlayBytes = _sam2Controller.state.overlayBytes;
+    if (overlayBytes.isEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _stereoStatus = 'Kaydedilecek SAM2 maskesi bulunamadı.';
+      });
+      return;
+    }
+
+    Directory baseDir;
+    if (Platform.isAndroid) {
+      baseDir = Directory('/storage/emulated/0/Download/Multicam/sam2');
+    } else {
+      final docsDir = await getApplicationDocumentsDirectory();
+      baseDir = Directory(
+        '${docsDir.path}${Platform.pathSeparator}Multicam${Platform.pathSeparator}sam2',
+      );
+    }
+
+    if (!await baseDir.exists()) {
+      await baseDir.create(recursive: true);
+    }
+
+    final target = _sam2Controller.state.target;
+    final targetLabel = target == Sam2PreviewTarget.camera1 ? 'cam1' : 'cam2';
+    final timestamp = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
+    final file = File(
+      '${baseDir.path}${Platform.pathSeparator}sam2_${targetLabel}_$timestamp.png',
+    );
+    await file.writeAsBytes(overlayBytes, flush: true);
+
+    if (!mounted) return;
+    setState(() {
+      _lastSam2OutputPath = file.path;
+      _stereoStatus = 'SAM2 maskesi kaydedildi: ${file.path}';
+    });
+  }
+
+  void _setSam2Target(Sam2PreviewTarget target) {
+    _resetSam2Overlay();
+    _sam2Controller.setTarget(target);
+  }
+
+  Uint8List? _sam2PreviewBytesFor(Sam2PreviewTarget target) {
+    final rectifiedBytes = switch (target) {
+      Sam2PreviewTarget.camera1 => _rectifiedCam1PreviewBytes,
+      Sam2PreviewTarget.camera2 => _rectifiedCam2PreviewBytes,
+    };
+
+    if (rectifiedBytes != null && rectifiedBytes.isNotEmpty) {
+      return rectifiedBytes;
+    }
+
+    return switch (target) {
+      Sam2PreviewTarget.camera1 => _lastCam1PreviewBytes,
+      Sam2PreviewTarget.camera2 => _lastCam2PreviewBytes,
+    };
+  }
+
+  Future<void> _ensureSam2StereoSourceReady() async {
+    if (!_hasCachedCalibration) {
+      return;
+    }
+
+    final hasRectifiedPair =
+        _rectifiedCam1PreviewBytes != null &&
+        _rectifiedCam1PreviewBytes!.isNotEmpty &&
+        _rectifiedCam2PreviewBytes != null &&
+        _rectifiedCam2PreviewBytes!.isNotEmpty;
+    if (hasRectifiedPair) {
+      return;
+    }
+
+    var cam1Bytes = _lastCam1PreviewBytes;
+    var cam2Bytes = _lastCam2PreviewBytes;
+    final hasRawPair =
+        cam1Bytes != null &&
+        cam1Bytes.isNotEmpty &&
+        cam2Bytes != null &&
+        cam2Bytes.isNotEmpty;
+
+    if (!hasRawPair && _isReady && !_isRecording) {
+      await _capturePreviewFrame();
+      cam1Bytes = _lastCam1PreviewBytes;
+      cam2Bytes = _lastCam2PreviewBytes;
+    }
+
+    if (cam1Bytes == null ||
+        cam1Bytes.isEmpty ||
+        cam2Bytes == null ||
+        cam2Bytes.isEmpty) {
+      return;
+    }
+
+    final result = await _rectifyPreviewFramePairUseCase(cam1Bytes, cam2Bytes);
+    if (!result.success) {
+      if (!mounted) return;
+      setState(() {
+        _stereoStatus =
+            'Rectify hazırlanamadı, SAM2 ham preview ile devam edecek.';
+      });
+      return;
+    }
+
+    final pair = _extractRectifiedPreviewPair(result);
+    final rectifiedCam1 = pair.$1;
+    final rectifiedCam2 = pair.$2;
+    if (rectifiedCam1 == null ||
+        rectifiedCam1.isEmpty ||
+        rectifiedCam2 == null ||
+        rectifiedCam2.isEmpty) {
+      return;
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _rectifiedCam1PreviewBytes = rectifiedCam1;
+      _rectifiedCam2PreviewBytes = rectifiedCam2;
+      _stereoStatus = 'SAM2 için rectified preview hazır.';
+    });
+  }
+
+  Future<void> _runSam2OnCurrentPreview() async {
+    await _ensureSam2StereoSourceReady();
+
+    var sourceBytes = _sam2FrozenTarget == _sam2Controller.state.target
+        ? _sam2FrozenPreviewBytes
+        : null;
+
+    sourceBytes ??= _sam2PreviewBytesFor(_sam2Controller.state.target);
+    if ((sourceBytes == null || sourceBytes.isEmpty) &&
+        _isReady &&
+        !_isRecording) {
+      await _capturePreviewFrame();
+      sourceBytes = _sam2PreviewBytesFor(_sam2Controller.state.target);
+    }
+
+    if (sourceBytes == null || sourceBytes.isEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _stereoStatus = 'SAM2 için güncel preview karesi bulunamadı.';
+      });
+      return;
+    }
+
+    await _sam2Controller.segmentFrame(sourceBytes);
+    if (_sam2Controller.state.hasOverlay) {
+      _sam2FrozenPreviewBytes = sourceBytes;
+      _sam2FrozenTarget = _sam2Controller.state.target;
+    } else {
+      _resetSam2Overlay();
+    }
+  }
+
+  void _handleSam2PromptTap(
+    Sam2PreviewTarget target,
+    Offset localPosition,
+    Size widgetSize, {
+    required bool isPositive,
+  }) {
+    if (_phase != CaptureWorkflowPhase.sam2Segmentation) {
+      return;
+    }
+
+    if (_sam2Controller.state.target != target) {
+      return;
+    }
+
+    final width = widgetSize.width <= 0 ? 1.0 : widgetSize.width;
+    final height = widgetSize.height <= 0 ? 1.0 : widgetSize.height;
+    final x = (localPosition.dx / width).clamp(0.0, 1.0) * _previewImageWidth;
+    final y = (localPosition.dy / height).clamp(0.0, 1.0) * _previewImageHeight;
+
+    _sam2Controller.addPoint(x: x, y: y, isPositive: isPositive);
   }
 
   Future<void> _persistAndSetSettings(
@@ -469,6 +686,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
 
     _isOpeningCameras = true;
     _stopPreviewLoop();
+    _clearSam2Selection();
 
     if (!mounted) {
       _isOpeningCameras = false;
@@ -1031,7 +1249,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
         _checkerboardStatus =
             '✓ Bu açıdan fotoğraf çekildi ($_capturedCalibrationPairs/$_requiredCalibrationPairs). Sıradaki açıya geç.';
         _status =
-            'Faz 2: ${_capturedCalibrationPairs}/$_requiredCalibrationPairs kaydedildi. Kartı 1-2 sn içinde yeni açıya taşı.';
+            'Faz 2: $_capturedCalibrationPairs/$_requiredCalibrationPairs kaydedildi. Kartı 1-2 sn içinde yeni açıya taşı.';
       });
     } finally {
       _isCheckerboardDetecting = false;
@@ -1174,6 +1392,10 @@ class _MultiCamPageState extends State<MultiCamPage> {
     if (!mounted) return;
     setState(() {
       _phase = nextPhase;
+      if (nextPhase != CaptureWorkflowPhase.sam2Segmentation) {
+        _resetSam2Overlay();
+        _sam2Controller.clearSelection();
+      }
       if (nextPhase != CaptureWorkflowPhase.stereoMatching) {
         _showRectifiedPreview = false;
         _rectifiedCam1PreviewBytes = null;
@@ -1196,6 +1418,17 @@ class _MultiCamPageState extends State<MultiCamPage> {
       } else if (nextPhase == CaptureWorkflowPhase.depthMap) {
         _status =
             'Faz 4 hazır. Canlı derinlik haritası için "Canlı Derinlik Başlat" butonuna basın.';
+      } else if (nextPhase == CaptureWorkflowPhase.sam2Segmentation) {
+        _lastSam2OutputPath = null;
+        _status =
+            'Faz 5 hazır. Preview üzerine dokunarak prompt ekleyip SAM2 segmentasyonunu çalıştırın.';
+        if (_hasCachedCalibration) {
+          _stereoStatus =
+              'Kayıtlı kalibrasyon bulundu. Faz 5, rectified stereo preview üzerinden çalışacak.';
+        } else {
+          _stereoStatus =
+              'Kayıtlı kalibrasyon bulunamadı. Faz 5, ham preview üzerinden çalışacak.';
+        }
       } else {
         _isCalibrationCaptureRunning = false;
         _cam1CheckerboardCorners = const [];
@@ -1336,7 +1569,8 @@ class _MultiCamPageState extends State<MultiCamPage> {
     required Uint8List cam1Bytes,
     required Uint8List cam2Bytes,
   }) async {
-    if (_phase != CaptureWorkflowPhase.stereoMatching || !_showRectifiedPreview) {
+    if (_phase != CaptureWorkflowPhase.stereoMatching ||
+        !_showRectifiedPreview) {
       return;
     }
     if (_isStereoProcessing || _isLiveRectifyProcessing) {
@@ -1352,7 +1586,10 @@ class _MultiCamPageState extends State<MultiCamPage> {
     _isLiveRectifyProcessing = true;
     _lastLiveRectifyAt = now;
     try {
-      final result = await _rectifyPreviewFramePairUseCase(cam1Bytes, cam2Bytes);
+      final result = await _rectifyPreviewFramePairUseCase(
+        cam1Bytes,
+        cam2Bytes,
+      );
       if (!mounted) return;
 
       if (!result.success) {
@@ -1568,6 +1805,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
       CaptureWorkflowPhase.calibration => 'calib_',
       CaptureWorkflowPhase.stereoMatching => 'rectify_',
       CaptureWorkflowPhase.depthMap => 'depth_',
+      CaptureWorkflowPhase.sam2Segmentation => 'sam2_',
     };
 
     final timestamp = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
@@ -1704,9 +1942,21 @@ class _MultiCamPageState extends State<MultiCamPage> {
     String label, {
     required List<Offset> checkerCorners,
     required bool checkerFound,
+    required Sam2PreviewTarget previewTarget,
   }) {
-    final hasPreviewBytes = previewBytes != null && previewBytes.isNotEmpty;
+    final sam2State = _sam2Controller.state;
+    final showSam2Overlay =
+        sam2State.hasOverlay && _sam2FrozenTarget == previewTarget;
+    final displayBytes = showSam2Overlay
+        ? sam2State.overlayBytes
+        : previewBytes;
+    final hasPreviewBytes = displayBytes != null && displayBytes.isNotEmpty;
     final hasLastFrame = lastFrame != null && lastFrame.existsSync();
+    final canInteractWithSam2 =
+        _phase == CaptureWorkflowPhase.sam2Segmentation &&
+        sam2State.target == previewTarget;
+    final showSam2TargetBadge = canInteractWithSam2;
+    final showSam2MaskBadge = showSam2Overlay;
 
     if (!hasPreviewBytes && !hasLastFrame) {
       return Container(
@@ -1738,47 +1988,125 @@ class _MultiCamPageState extends State<MultiCamPage> {
         ),
       );
     }
-    return Stack(
-      fit: StackFit.expand,
-      children: [
-        if (hasPreviewBytes)
-          Image.memory(
-            previewBytes,
-            fit: BoxFit.cover,
-            gaplessPlayback: true,
-            filterQuality: FilterQuality.low,
-          )
-        else
-          Image.file(
-            lastFrame!,
-            fit: BoxFit.cover,
-            gaplessPlayback: true,
-            filterQuality: FilterQuality.low,
-          ),
-        Positioned(
-          top: 8,
-          left: 8,
-          child: Container(
-            color: Colors.black54,
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-            child: Text(
-              label,
-              style: const TextStyle(color: Colors.white, fontSize: 14),
-            ),
+    return Container(
+      color: Colors.black,
+      child: Center(
+        child: AspectRatio(
+          aspectRatio: _previewAspectRatio,
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final previewSize = Size(
+                constraints.maxWidth,
+                constraints.maxHeight,
+              );
+
+              return GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTapUp: canInteractWithSam2
+                    ? (details) {
+                        _handleSam2PromptTap(
+                          previewTarget,
+                          details.localPosition,
+                          previewSize,
+                          isPositive: true,
+                        );
+                      }
+                    : null,
+                onLongPressStart: canInteractWithSam2
+                    ? (details) {
+                        _handleSam2PromptTap(
+                          previewTarget,
+                          details.localPosition,
+                          previewSize,
+                          isPositive: false,
+                        );
+                      }
+                    : null,
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    if (hasPreviewBytes)
+                      Image.memory(
+                        displayBytes,
+                        fit: BoxFit.fill,
+                        gaplessPlayback: true,
+                        filterQuality: FilterQuality.low,
+                      )
+                    else
+                      Image.file(
+                        lastFrame!,
+                        fit: BoxFit.fill,
+                        gaplessPlayback: true,
+                        filterQuality: FilterQuality.low,
+                      ),
+                    Positioned(
+                      top: 8,
+                      left: 8,
+                      child: Container(
+                        color: Colors.black54,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 6,
+                          vertical: 2,
+                        ),
+                        child: Text(
+                          label,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 14,
+                          ),
+                        ),
+                      ),
+                    ),
+                    if (showSam2TargetBadge)
+                      Positioned(
+                        top: 8,
+                        right: 8,
+                        child: Container(
+                          color: Colors.teal.withValues(alpha: 0.82),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 3,
+                          ),
+                          child: Text(
+                            showSam2MaskBadge ? 'SAM2 Maske' : 'SAM2 Hedef',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      ),
+                    if (_phase == CaptureWorkflowPhase.calibration)
+                      Positioned.fill(
+                        child: IgnorePointer(
+                          child: CustomPaint(
+                            painter: _CheckerboardOverlayPainter(
+                              checkerCorners: checkerCorners,
+                              checkerFound: checkerFound,
+                            ),
+                          ),
+                        ),
+                      ),
+                    if (canInteractWithSam2)
+                      Positioned.fill(
+                        child: IgnorePointer(
+                          child: CustomPaint(
+                            painter: _Sam2PromptOverlayPainter(
+                              points: sam2State.points,
+                              imageWidth: _previewImageWidth,
+                              imageHeight: _previewImageHeight,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              );
+            },
           ),
         ),
-        if (_phase == CaptureWorkflowPhase.calibration)
-          Positioned.fill(
-            child: IgnorePointer(
-              child: CustomPaint(
-                painter: _CheckerboardOverlayPainter(
-                  checkerCorners: checkerCorners,
-                  checkerFound: checkerFound,
-                ),
-              ),
-            ),
-          ),
-      ],
+      ),
     );
   }
 
@@ -1992,6 +2320,8 @@ class _MultiCamPageState extends State<MultiCamPage> {
         return _buildPhaseThreeContent();
       case CaptureWorkflowPhase.depthMap:
         return _buildPhaseFourContent();
+      case CaptureWorkflowPhase.sam2Segmentation:
+        return _buildPhaseFiveContent();
     }
   }
 
@@ -2161,9 +2491,11 @@ class _MultiCamPageState extends State<MultiCamPage> {
                           _requiredCalibrationPairs = nextRequired;
                           if (_capturedCalibrationPairs >
                               _requiredCalibrationPairs) {
-                            _capturedCalibrationPairs = _requiredCalibrationPairs;
+                            _capturedCalibrationPairs =
+                                _requiredCalibrationPairs;
                           }
-                          _checkerboardStatus = _capturedCalibrationPairs >=
+                          _checkerboardStatus =
+                              _capturedCalibrationPairs >=
                                   _requiredCalibrationPairs
                               ? '✓ Gerekli fotoğraf sayısı tamamlandı ($_capturedCalibrationPairs/$_requiredCalibrationPairs).'
                               : 'Hazır. Kaydı başlatmak için "Çekimi Başlat" butonuna basın ($_capturedCalibrationPairs/$_requiredCalibrationPairs).';
@@ -2303,6 +2635,15 @@ class _MultiCamPageState extends State<MultiCamPage> {
             style: const TextStyle(color: Colors.lightGreenAccent),
           ),
         const SizedBox(height: 8),
+        if ((_lastSam2OutputPath ?? '').isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Text(
+              'Son çıktı: $_lastSam2OutputPath',
+              style: const TextStyle(color: Colors.lightGreenAccent),
+            ),
+          ),
+        const SizedBox(height: 8),
         Row(
           children: [
             Expanded(
@@ -2374,9 +2715,46 @@ class _MultiCamPageState extends State<MultiCamPage> {
                   ? null
                   : () {
                       unawaited(
-                        _setPhase(CaptureWorkflowPhase.cameraSelection),
+                        _setPhase(CaptureWorkflowPhase.sam2Segmentation),
                       );
                     },
+              child: const Text('Faz 5'),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildPhaseFiveContent() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'SAM2 ile seçilen preview karesi üzerinde etkileşimli segmentasyon yapılır.',
+          style: TextStyle(color: Colors.white70),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          _hasCachedCalibration
+              ? 'Kayıtlı kalibrasyon bulunduğu için Faz 5 rectified stereo preview kullanır. Hedef kamerayı seçin, preview üzerine dokunarak pozitif, uzun basarak negatif prompt ekleyin ve segmentasyonu çalıştırın.'
+              : 'Kalibrasyon yoksa Faz 5 ham preview ile çalışır. Hedef kamerayı seçin, preview üzerine dokunarak pozitif, uzun basarak negatif prompt ekleyin ve segmentasyonu çalıştırın.',
+          style: const TextStyle(color: Colors.white54, fontSize: 12),
+        ),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            OutlinedButton(
+              onPressed: () {
+                unawaited(_setPhase(CaptureWorkflowPhase.depthMap));
+              },
+              child: const Text('Faz 4'),
+            ),
+            const SizedBox(width: 8),
+            OutlinedButton(
+              onPressed: () {
+                unawaited(_setPhase(CaptureWorkflowPhase.cameraSelection));
+              },
               child: const Text('Faz 1'),
             ),
           ],
@@ -2389,8 +2767,10 @@ class _MultiCamPageState extends State<MultiCamPage> {
   Widget build(BuildContext context) {
     final currentViewMode = _settings.effectiveViewMode;
     final showRectifiedInPreview =
-        _phase == CaptureWorkflowPhase.stereoMatching &&
-        _showRectifiedPreview;
+        (_phase == CaptureWorkflowPhase.stereoMatching &&
+            _showRectifiedPreview) ||
+        (_phase == CaptureWorkflowPhase.sam2Segmentation &&
+            _hasCachedCalibration);
     final cam1PreviewBytes = showRectifiedInPreview
         ? (_rectifiedCam1PreviewBytes ?? _lastCam1PreviewBytes)
         : _lastCam1PreviewBytes;
@@ -2418,6 +2798,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
                             'Arka Kamera 1',
                             checkerCorners: _cam1CheckerboardCorners,
                             checkerFound: _checkerboardFoundCam1,
+                            previewTarget: Sam2PreviewTarget.camera1,
                           ),
                         ),
                       if (currentViewMode == 'Çift Kamera' ||
@@ -2429,6 +2810,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
                             'Arka Kamera 2',
                             checkerCorners: _cam2CheckerboardCorners,
                             checkerFound: _checkerboardFoundCam2,
+                            previewTarget: Sam2PreviewTarget.camera2,
                           ),
                         ),
                     ],
@@ -2436,34 +2818,59 @@ class _MultiCamPageState extends State<MultiCamPage> {
           ),
           if (_settings.effectiveEnableStats)
             MulticamStatsBar(stats: _systemStats, actualFps: _actualFps),
-          Container(
-            width: double.infinity,
-            color: Colors.black,
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                _buildPhaseSelector(),
-                const SizedBox(height: 8),
-                _buildPhaseContent(),
-                const SizedBox(height: 8),
-                Text(_status, style: const TextStyle(color: Colors.white)),
-                if (_stereoStatus.isNotEmpty) ...[
-                  const SizedBox(height: 4),
-                  Text(
-                    _stereoStatus,
-                    style: const TextStyle(color: Colors.amberAccent),
-                  ),
-                ],
-                const SizedBox(height: 4),
-                Text(
-                  'FoT: ${_settings.effectiveEnableFot ? (_fotCm?.toStringAsFixed(2) ?? '-') : 'Kapalı'} | '
-                  'Acc: ${_settings.effectiveEnableImu ? '${_fmt(_accX, digits: 2)}, ${_fmt(_accY, digits: 2)}, ${_fmt(_accZ, digits: 2)}' : 'Kapalı'} | '
-                  'Gyro: ${_settings.effectiveEnableImu ? '${_fmt(_gyroX, digits: 2)}, ${_fmt(_gyroY, digits: 2)}, ${_fmt(_gyroZ, digits: 2)}' : 'Kapalı'}',
-                  style: const TextStyle(color: Colors.white60, fontSize: 12),
+          Flexible(
+            fit: FlexFit.loose,
+            child: Container(
+              width: double.infinity,
+              color: Colors.black,
+              padding: const EdgeInsets.all(12),
+              child: SingleChildScrollView(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _buildPhaseSelector(),
+                    const SizedBox(height: 8),
+                    _buildPhaseContent(),
+                    if (_phase == CaptureWorkflowPhase.sam2Segmentation) ...[
+                      const SizedBox(height: 12),
+                      Sam2ControlPanel(
+                        state: _sam2Controller.state,
+                        onTargetChanged: _setSam2Target,
+                        onRunPressed: () {
+                          unawaited(_runSam2OnCurrentPreview());
+                        },
+                        onSavePressed: () {
+                          unawaited(_saveSam2Overlay());
+                        },
+                        onClearPressed: _clearSam2Selection,
+                        onRemoveLastPointPressed:
+                            _sam2Controller.removeLastPoint,
+                        canSaveOutput: _sam2Controller.state.hasOverlay,
+                      ),
+                    ],
+                    const SizedBox(height: 8),
+                    Text(_status, style: const TextStyle(color: Colors.white)),
+                    if (_stereoStatus.isNotEmpty) ...[
+                      const SizedBox(height: 4),
+                      Text(
+                        _stereoStatus,
+                        style: const TextStyle(color: Colors.amberAccent),
+                      ),
+                    ],
+                    const SizedBox(height: 4),
+                    Text(
+                      'FoT: ${_settings.effectiveEnableFot ? (_fotCm?.toStringAsFixed(2) ?? '-') : 'Kapalı'} | '
+                      'Acc: ${_settings.effectiveEnableImu ? '${_fmt(_accX, digits: 2)}, ${_fmt(_accY, digits: 2)}, ${_fmt(_accZ, digits: 2)}' : 'Kapalı'} | '
+                      'Gyro: ${_settings.effectiveEnableImu ? '${_fmt(_gyroX, digits: 2)}, ${_fmt(_gyroY, digits: 2)}, ${_fmt(_gyroZ, digits: 2)}' : 'Kapalı'}',
+                      style: const TextStyle(
+                        color: Colors.white60,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
                 ),
-              ],
+              ),
             ),
           ),
         ],
@@ -2489,8 +2896,8 @@ class _CheckerboardOverlayPainter extends CustomPainter {
 
     final pointPaint = Paint()
       ..color = checkerFound
-          ? Colors.lightGreenAccent.withOpacity(0.95)
-          : Colors.orangeAccent.withOpacity(0.95)
+          ? Colors.lightGreenAccent.withValues(alpha: 0.95)
+          : Colors.orangeAccent.withValues(alpha: 0.95)
       ..style = PaintingStyle.fill;
 
     for (final corner in checkerCorners) {
@@ -2509,6 +2916,64 @@ class _CheckerboardOverlayPainter extends CustomPainter {
     }
     for (var index = 0; index < checkerCorners.length; index++) {
       if (checkerCorners[index] != oldDelegate.checkerCorners[index]) {
+        return true;
+      }
+    }
+    return false;
+  }
+}
+
+class _Sam2PromptOverlayPainter extends CustomPainter {
+  final List<Sam2Point> points;
+  final double imageWidth;
+  final double imageHeight;
+
+  const _Sam2PromptOverlayPainter({
+    required this.points,
+    required this.imageWidth,
+    required this.imageHeight,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (points.isEmpty || imageWidth <= 0 || imageHeight <= 0) {
+      return;
+    }
+
+    for (final point in points) {
+      final dx = (point.x / imageWidth) * size.width;
+      final dy = (point.y / imageHeight) * size.height;
+      final color = point.isPositive
+          ? Colors.lightGreenAccent
+          : Colors.redAccent;
+
+      final fillPaint = Paint()
+        ..color = color.withValues(alpha: 0.9)
+        ..style = PaintingStyle.fill;
+      final strokePaint = Paint()
+        ..color = Colors.black.withValues(alpha: 0.8)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.5;
+
+      canvas.drawCircle(Offset(dx, dy), 7, fillPaint);
+      canvas.drawCircle(Offset(dx, dy), 7, strokePaint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _Sam2PromptOverlayPainter oldDelegate) {
+    if (imageWidth != oldDelegate.imageWidth ||
+        imageHeight != oldDelegate.imageHeight ||
+        points.length != oldDelegate.points.length) {
+      return true;
+    }
+
+    for (var index = 0; index < points.length; index++) {
+      final point = points[index];
+      final oldPoint = oldDelegate.points[index];
+      if (point.x != oldPoint.x ||
+          point.y != oldPoint.y ||
+          point.isPositive != oldPoint.isPositive) {
         return true;
       }
     }

@@ -271,6 +271,21 @@ class StereoPreprocessManager(private val context: Context) {
             Imgproc.remap(src1, rect1, rectifyMaps.map1x, rectifyMaps.map1y, Imgproc.INTER_LINEAR)
             Imgproc.remap(src2, rect2, rectifyMaps.map2x, rectifyMaps.map2y, Imgproc.INTER_LINEAR)
 
+            val hasUsableRectifiedPair =
+                hasUsableVisualContent(rect1) && hasUsableVisualContent(rect2)
+            if (!hasUsableRectifiedPair) {
+                src1.release()
+                src2.release()
+                rect1.release()
+                rect2.release()
+                return mapOf(
+                    "success" to false,
+                    "message" to "Rectify çıktısı neredeyse tamamen siyah kaldı. Büyük olasılıkla kalibrasyon bu preview ile uyumlu değil; Faz 2 kalibrasyonunu tekrar üretin.",
+                    "processedPairs" to 0,
+                    "outputPath" to calibrationFile.absolutePath,
+                )
+            }
+
             val out1 = MatOfByte()
             val out2 = MatOfByte()
             val ok1 = Imgcodecs.imencode(".jpg", rect1, out1)
@@ -867,6 +882,22 @@ class StereoPreprocessManager(private val context: Context) {
         val scaledWidth = (sourceSize.width * DEPTH_DOWNSCALE).toInt().coerceAtLeast(160)
         val scaledHeight = (sourceSize.height * DEPTH_DOWNSCALE).toInt().coerceAtLeast(120)
         return Size(scaledWidth.toDouble(), scaledHeight.toDouble())
+    }
+
+    private fun hasUsableVisualContent(image: Mat): Boolean {
+        if (image.empty()) {
+            return false
+        }
+
+        val gray = Mat()
+        Imgproc.cvtColor(image, gray, Imgproc.COLOR_BGR2GRAY)
+        val nonZeroPixels = Core.countNonZero(gray)
+        val totalPixels = gray.rows() * gray.cols()
+        val usableRatio = if (totalPixels > 0) nonZeroPixels.toDouble() / totalPixels.toDouble() else 0.0
+        val meanIntensity = Core.mean(gray).`val`[0]
+        gray.release()
+
+        return usableRatio >= 0.05 && meanIntensity >= 8.0
     }
 
     private fun getOrCreateStereoBm(imageWidth: Int): StereoBM {

@@ -1,5 +1,7 @@
-﻿import 'package:archive/archive_io.dart';
 import 'dart:io';
+
+import 'package:archive/archive_io.dart';
+import 'package:flutter/foundation.dart';
 
 void main() async {
   var d = Directory('testzip');
@@ -8,5 +10,5 @@ void main() async {
 
   var encoder = ZipFileEncoder();
   await encoder.zipDirectory(d, filename: 'out_test_final.zip');
-  print('Size: ${File('out_test_final.zip').lengthSync()}');
+  debugPrint('Size: ${File('out_test_final.zip').lengthSync()}');
 }

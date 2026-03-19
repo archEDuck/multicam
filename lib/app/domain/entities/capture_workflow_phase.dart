@@ -3,6 +3,7 @@ enum CaptureWorkflowPhase {
   calibration,
   stereoMatching,
   depthMap,
+  sam2Segmentation,
 }
 
 extension CaptureWorkflowPhaseLabel on CaptureWorkflowPhase {
@@ -16,6 +17,8 @@ extension CaptureWorkflowPhaseLabel on CaptureWorkflowPhase {
         return 'Faz 3';
       case CaptureWorkflowPhase.depthMap:
         return 'Faz 4';
+      case CaptureWorkflowPhase.sam2Segmentation:
+        return 'Faz 5';
     }
   }
 
@@ -29,6 +32,8 @@ extension CaptureWorkflowPhaseLabel on CaptureWorkflowPhase {
         return 'Stereo Eşleme';
       case CaptureWorkflowPhase.depthMap:
         return 'Derinlik Haritası';
+      case CaptureWorkflowPhase.sam2Segmentation:
+        return 'SAM2 Segmentasyon';
     }
   }
 }
