@@ -8,7 +8,6 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.hardware.camera2.*
-import android.hardware.camera2.params.StreamConfigurationMap
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.RggbChannelVector
 import android.hardware.camera2.params.SessionConfiguration
@@ -31,8 +30,6 @@ import java.util.concurrent.TimeUnit
  * 2. Configure two outputs bound to two physical cameras
  * 3. Run a REPEATING preview request to keep the pipeline warm
  * 4. On captureDualFrame(), grab latest frames from ImageReaders
- *
- * Fallback: alternating capture if no logical multi-camera found.
  */
 class DualCameraManager(private val context: Context) {
     companion object {
@@ -40,12 +37,10 @@ class DualCameraManager(private val context: Context) {
         private const val IMAGE_WIDTH = 1920
         private const val IMAGE_HEIGHT = 1080
         private const val OPEN_TIMEOUT_MS = 5000L
-        private const val CAPTURE_TIMEOUT_MS = 3000L
     }
 
     enum class CaptureMode {
-        LOGICAL_MULTI_CAMERA,
-        ALTERNATING
+        LOGICAL_MULTI_CAMERA
     }
 
     data class LogicalCameraInfo(
@@ -81,10 +76,6 @@ class DualCameraManager(private val context: Context) {
     // Latest frame byte buffers (written by ImageReader listener, read by captureDualFrame)
     @Volatile private var latestBytes1: ByteArray? = null
     @Volatile private var latestBytes2: ByteArray? = null
-
-    // For ALTERNATING mode
-    private var altCam1Id: String? = null
-    private var altCam2Id: String? = null
 
     // Metadata for current session
     private var intrinsicsFx = ""
@@ -168,48 +159,10 @@ class DualCameraManager(private val context: Context) {
             }
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val backIds = getBackCameraIds()
-            val candidates = mutableListOf<Pair<String, String>>()
-            for (group in cameraManager.concurrentCameraIds) {
-                val backInGroup = group.filter { backIds.contains(it) }
-                if (backInGroup.size >= 2) {
-                    for (i in 0 until backInGroup.size - 1) {
-                        for (j in i + 1 until backInGroup.size) {
-                            candidates.add(backInGroup[i] to backInGroup[j])
-                        }
-                    }
-                }
-            }
-            val best = chooseBestPair(candidates)
-            if (best != null) {
-                return mapOf(
-                    "found" to true,
-                    "cam1Id" to best.first,
-                    "cam2Id" to best.second,
-                    "mode" to "concurrent",
-                )
-            }
-        }
-
-        val backIds = getBackCameraIds()
-        val fallbackCandidates = mutableListOf<Pair<String, String>>()
-        for (i in 0 until backIds.size - 1) {
-            for (j in i + 1 until backIds.size) {
-                fallbackCandidates.add(backIds[i] to backIds[j])
-            }
-        }
-        val bestFallback = chooseBestPair(fallbackCandidates)
-        return if (bestFallback != null) {
-            mapOf(
-                "found" to true,
-                "cam1Id" to bestFallback.first,
-                "cam2Id" to bestFallback.second,
-                "mode" to "alternating",
-            )
-        } else {
-            mapOf("found" to false)
-        }
+        return mapOf(
+            "found" to false,
+            "error" to "Bu cihazda logical multi-camera destekli arka kamera çifti bulunamadı.",
+        )
     }
 
     private fun chooseBestPair(candidates: List<Pair<String, String>>): Pair<String, String>? {
@@ -279,10 +232,14 @@ class DualCameraManager(private val context: Context) {
         if (logicalInfo != null) {
             val result = openLogicalMultiCamera(logicalInfo)
             if (result["success"] == true) return result
-            Log.w(TAG, "Logical multi-camera failed, falling back to alternating")
+            return result
         }
 
-        return openAlternating(cam1Id, cam2Id)
+        closeCameras()
+        return mapOf(
+            "success" to false,
+            "error" to "Seçilen kamera çifti logical multi-camera olarak aynı anda açılamıyor.",
+        )
     }
 
     private fun extractIntrinsicsAndDistortion(cameraId: String) {
@@ -508,22 +465,6 @@ class DualCameraManager(private val context: Context) {
         }
     }
 
-    private fun openAlternating(cam1Id: String, cam2Id: String): Map<String, Any> {
-        Log.i(TAG, "Using alternating capture mode: $cam1Id, $cam2Id")
-        captureMode = CaptureMode.ALTERNATING
-        altCam1Id = cam1Id
-        altCam2Id = cam2Id
-        physicalId1 = cam1Id
-        physicalId2 = cam2Id
-        isOpen = true
-        return mapOf(
-            "success" to true,
-            "mode" to "alternating",
-            "cam1Id" to cam1Id,
-            "cam2Id" to cam2Id,
-        )
-    }
-
     // ─── Capture ───
 
     fun captureDualFrame(cam1Path: String, cam2Path: String): Map<String, Any> {
@@ -533,7 +474,6 @@ class DualCameraManager(private val context: Context) {
 
         val baseMap = when (captureMode) {
             CaptureMode.LOGICAL_MULTI_CAMERA -> captureLogicalMultiCamera(cam1Path, cam2Path)
-            CaptureMode.ALTERNATING -> captureAlternating(cam1Path, cam2Path)
             else -> mapOf("success" to false, "error" to "Unknown mode", "cam1Saved" to false, "cam2Saved" to false)
         }
 
@@ -556,13 +496,9 @@ class DualCameraManager(private val context: Context) {
         // Mocked or external values if not available natively here
         result["plane_data"] = ""
         result["bbox_data"] = ""
-        result["cam1Id"] = physicalId1 ?: altCam1Id ?: ""
-        result["cam2Id"] = physicalId2 ?: altCam2Id ?: ""
-        result["capture_mode"] = when (captureMode) {
-            CaptureMode.LOGICAL_MULTI_CAMERA -> "logical_multi_camera"
-            CaptureMode.ALTERNATING -> "alternating"
-            else -> ""
-        }
+        result["cam1Id"] = physicalId1 ?: ""
+        result["cam2Id"] = physicalId2 ?: ""
+        result["capture_mode"] = "logical_multi_camera"
 
         return result
     }
@@ -578,11 +514,7 @@ class DualCameraManager(private val context: Context) {
             )
         }
 
-        val mode = when (captureMode) {
-            CaptureMode.LOGICAL_MULTI_CAMERA -> "logical_multi_camera"
-            CaptureMode.ALTERNATING -> "alternating"
-            else -> ""
-        }
+        val mode = "logical_multi_camera"
 
         if (captureMode != CaptureMode.LOGICAL_MULTI_CAMERA) {
             return mapOf(
@@ -590,8 +522,8 @@ class DualCameraManager(private val context: Context) {
                 "error" to "Live preview is only available in logical multi-camera mode",
                 "cam1Bytes" to ByteArray(0),
                 "cam2Bytes" to ByteArray(0),
-                "cam1Id" to (physicalId1 ?: altCam1Id ?: ""),
-                "cam2Id" to (physicalId2 ?: altCam2Id ?: ""),
+                "cam1Id" to (physicalId1 ?: ""),
+                "cam2Id" to (physicalId2 ?: ""),
                 "capture_mode" to mode,
             )
         }
@@ -602,8 +534,8 @@ class DualCameraManager(private val context: Context) {
             "success" to (bytes1 != null || bytes2 != null),
             "cam1Bytes" to (bytes1 ?: ByteArray(0)),
             "cam2Bytes" to (bytes2 ?: ByteArray(0)),
-            "cam1Id" to (physicalId1 ?: altCam1Id ?: ""),
-            "cam2Id" to (physicalId2 ?: altCam2Id ?: ""),
+            "cam1Id" to (physicalId1 ?: ""),
+            "cam2Id" to (physicalId2 ?: ""),
             "capture_mode" to mode,
         )
     }
@@ -649,144 +581,6 @@ class DualCameraManager(private val context: Context) {
         )
     }
 
-    /**
-     * Alternating capture: opens each camera, captures, closes, then next.
-     */
-    @SuppressLint("MissingPermission")
-    private fun captureAlternating(cam1Path: String, cam2Path: String): Map<String, Any> {
-        val results = mutableMapOf<String, Any>("success" to true, "cam1Saved" to false, "cam2Saved" to false)
-        val id1 = altCam1Id ?: return mapOf("success" to false, "error" to "cam1Id null", "cam1Saved" to false, "cam2Saved" to false)
-        val id2 = altCam2Id ?: return mapOf("success" to false, "error" to "cam2Id null", "cam1Saved" to false, "cam2Saved" to false)
-
-        try {
-            results["cam1Saved"] = captureSingleCamera(id1, cam1Path)
-        } catch (e: Exception) {
-            Log.e(TAG, "Alternating cam1 error", e)
-        }
-        try {
-            results["cam2Saved"] = captureSingleCamera(id2, cam2Path)
-        } catch (e: Exception) {
-            Log.e(TAG, "Alternating cam2 error", e)
-        }
-
-        results["success"] = (results["cam1Saved"] == true) || (results["cam2Saved"] == true)
-        return results
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun captureSingleCamera(cameraId: String, outputPath: String): Boolean {
-        var device: CameraDevice? = null
-        var session: CameraCaptureSession? = null
-        var reader: ImageReader? = null
-
-        try {
-            reader = ImageReader.newInstance(IMAGE_WIDTH, IMAGE_HEIGHT, ImageFormat.JPEG, 2)
-
-            val openLatch = CountDownLatch(1)
-            var openError: String? = null
-
-            cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
-                override fun onOpened(camera: CameraDevice) { device = camera; openLatch.countDown() }
-                override fun onDisconnected(camera: CameraDevice) { openError = "disconnected"; openLatch.countDown() }
-                override fun onError(camera: CameraDevice, errorCode: Int) { openError = "error=$errorCode"; openLatch.countDown() }
-            }, backgroundHandler)
-
-            if (!openLatch.await(OPEN_TIMEOUT_MS, TimeUnit.MILLISECONDS) || openError != null) return false
-
-            val sessionLatch = CountDownLatch(1)
-            var sessionFailed = false
-
-            device!!.createCaptureSession(
-                listOf(reader.surface),
-                object : CameraCaptureSession.StateCallback() {
-                    override fun onConfigured(s: CameraCaptureSession) { session = s; sessionLatch.countDown() }
-                    override fun onConfigureFailed(s: CameraCaptureSession) { sessionFailed = true; sessionLatch.countDown() }
-                },
-                backgroundHandler,
-            )
-
-            if (!sessionLatch.await(OPEN_TIMEOUT_MS, TimeUnit.MILLISECONDS) || sessionFailed) return false
-
-            // Fire a few preview frames first to warm up AE/AF
-            val previewRequest = device!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                addTarget(reader.surface)
-                set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
-            }.build()
-
-            val captureCallback = object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
-                    val expTime = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
-                    val iso = result.get(CaptureResult.SENSOR_SENSITIVITY)
-                    val gains = result.get(CaptureResult.COLOR_CORRECTION_GAINS)
-                    
-                        if (expTime != null) latestExposureMs = java.lang.String.format(java.util.Locale.US, "%.2f", expTime / 1000000.0)
-                    if (iso != null) latestIso = iso.toString()
-                    if (gains != null) latestKelvin = estimateCCT(gains)
-                }
-            }
-
-            session!!.setRepeatingRequest(previewRequest, captureCallback, backgroundHandler)
-            Thread.sleep(800) // Let AE/AF converge thoroughly
-            session!!.stopRepeating()
-
-            // Now take the actual still capture
-            val captureLatch = CountDownLatch(1)
-            var saved = false
-
-            reader.setOnImageAvailableListener({ r ->
-                val image = r.acquireLatestImage()
-                if (image != null) {
-                    try {
-                        val buffer = image.planes[0].buffer
-                        val bytes = ByteArray(buffer.remaining())
-                        buffer.get(bytes)
-                        saveJpeg(bytes, outputPath)
-                        saved = true
-                    } finally {
-                        image.close()
-                        captureLatch.countDown()
-                    }
-                } else {
-                    captureLatch.countDown()
-                }
-            }, backgroundHandler)
-
-            val stillRequest = device!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-                addTarget(reader.surface)
-                set(CaptureRequest.JPEG_QUALITY, 100.toByte())
-                set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-                set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)
-                set(CaptureRequest.JPEG_ORIENTATION, 90)
-            }.build()
-
-            val stillCaptureCallback = object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
-                    val expTime = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
-                    val iso = result.get(CaptureResult.SENSOR_SENSITIVITY)
-                    val gains = result.get(CaptureResult.COLOR_CORRECTION_GAINS)
-                    
-                    if (expTime != null) latestExposureMs = java.lang.String.format(java.util.Locale.US, "%.2f", expTime / 1000000.0)
-                    if (iso != null) latestIso = iso.toString()
-                    if (gains != null) latestKelvin = estimateCCT(gains)
-                }
-            }
-
-            session!!.capture(stillRequest, stillCaptureCallback, backgroundHandler)
-            captureLatch.await(CAPTURE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-
-            return saved
-
-        } finally {
-            try { session?.close() } catch (_: Exception) {}
-            try { device?.close() } catch (_: Exception) {}
-            try { reader?.close() } catch (_: Exception) {}
-        }
-    }
-
     // ─── Utilities ───
 
     private fun saveJpeg(bytes: ByteArray, path: String) {
@@ -816,8 +610,6 @@ class DualCameraManager(private val context: Context) {
             reader2 = null
             latestBytes1 = null
             latestBytes2 = null
-            altCam1Id = null
-            altCam2Id = null
             isOpen = false
             captureMode = null
             stopBackgroundThread()
@@ -845,20 +637,6 @@ class DualCameraManager(private val context: Context) {
         } catch (_: Exception) {
             false
         }
-    }
-
-    private fun getBackCameraIds(): List<String> {
-        val allIdsToInspect = mutableSetOf<String>()
-        for (id in cameraManager.cameraIdList) {
-            allIdsToInspect.add(id)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                try {
-                    val characteristics = cameraManager.getCameraCharacteristics(id)
-                    allIdsToInspect.addAll(characteristics.physicalCameraIds)
-                } catch (e: Exception) {}
-            }
-        }
-        return allIdsToInspect.filter { isBackCamera(it) }
     }
 
     private fun estimateCCT(gains: RggbChannelVector): String {

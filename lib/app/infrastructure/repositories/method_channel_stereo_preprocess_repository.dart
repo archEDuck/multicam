@@ -43,4 +43,25 @@ class MethodChannelStereoPreprocessRepository
       return StereoPreprocessResult.empty('Rectify hatası: $e');
     }
   }
+
+  @override
+  Future<StereoPreprocessResult> checkCheckerboard(
+    String cam1ImagePath,
+    String cam2ImagePath,
+  ) async {
+    try {
+      final dynamic raw = await _channel.invokeMethod('checkCheckerboard', {
+        'cam1Path': cam1ImagePath,
+        'cam2Path': cam2ImagePath,
+      });
+      if (raw is Map) {
+        return StereoPreprocessResult.fromMap(raw);
+      }
+      return StereoPreprocessResult.empty(
+        'Checkerboard sonucu okunamadı (boş yanıt).',
+      );
+    } catch (e) {
+      return StereoPreprocessResult.empty('Checkerboard kontrol hatası: $e');
+    }
+  }
 }

@@ -160,6 +160,18 @@ private class StereoPreprocessHandler(
 				}
 			}
 
+				"checkCheckerboard" -> {
+					val cam1Path = call.argument<String>("cam1Path")
+					val cam2Path = call.argument<String>("cam2Path")
+					if (cam1Path.isNullOrBlank() || cam2Path.isNullOrBlank()) {
+						result.error("INVALID_ARGS", "cam1Path and cam2Path are required", null)
+						return
+					}
+					runOnBackground(result) {
+						manager.checkCheckerboard(cam1Path, cam2Path)
+					}
+				}
+
 			"rectifySession" -> {
 				val sessionDir = call.argument<String>("sessionDir")
 				if (sessionDir.isNullOrBlank()) {

@@ -8,5 +8,5 @@ void main() async {
 
   var encoder = ZipFileEncoder();
   await encoder.zipDirectory(d, filename: 'out_test_final.zip');
-  print('Size: ' + File('out_test_final.zip').lengthSync().toString());
+  print('Size: ${File('out_test_final.zip').lengthSync()}');
 }

@@ -8,6 +8,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.textContaining('Stereo Pipeline'), findsOneWidget);
-    expect(find.text('Kaydı Başlat'), findsOneWidget);
+    expect(find.text('Kaydı Başlat'), findsNothing);
+    expect(find.text('Faz 2’ye Geç (Kalibrasyon)'), findsOneWidget);
   });
 }

@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -10,6 +9,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 
 import 'app/application/usecases/calibrate_stereo_session_use_case.dart';
+import 'app/application/usecases/check_checkerboard_frame_pair_use_case.dart';
 import 'app/application/usecases/get_system_stats_use_case.dart';
 import 'app/application/usecases/load_app_settings_use_case.dart';
 import 'app/application/usecases/rectify_stereo_session_use_case.dart';
@@ -111,6 +111,8 @@ class _MultiCamPageState extends State<MultiCamPage> {
   late final GetSystemStatsUseCase _getSystemStatsUseCase;
   late final CalibrateStereoSessionUseCase _calibrateStereoSessionUseCase;
   late final RectifyStereoSessionUseCase _rectifyStereoSessionUseCase;
+  late final CheckCheckerboardFramePairUseCase
+  _checkCheckerboardFramePairUseCase;
 
   StreamSubscription<dynamic>? _fotSubscription;
   StreamSubscription<UserAccelerometerEvent>? _accSubscription;
@@ -118,6 +120,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
   Timer? _captureTimer;
   Timer? _statsTimer;
   Timer? _previewTimer;
+  Timer? _checkerboardTimer;
 
   bool _isReady = false;
   bool _isRecording = false;
@@ -125,10 +128,14 @@ class _MultiCamPageState extends State<MultiCamPage> {
   bool _isStereoProcessing = false;
   bool _isOpeningCameras = false;
   bool _isPreviewCapturing = false;
+  bool _isCheckerboardDetecting = false;
+  bool _isAutoPhaseTransitioning = false;
 
   String _status = 'Başlatılıyor...';
   String _camera2Status = 'Camera2 raporu hazırlanıyor...';
   String _stereoStatus = '';
+  String _checkerboardStatus =
+      'Dama tahtası kontrolü bekleniyor. Faz 2’de otomatik aranır.';
 
   double? _fotCm;
   int _frameIndex = 0;
@@ -151,6 +158,11 @@ class _MultiCamPageState extends State<MultiCamPage> {
   Uint8List? _lastCam2PreviewBytes;
   File? _lastCam1Frame;
   File? _lastCam2Frame;
+  Directory? _previewCacheDir;
+  List<Offset> _cam1CheckerboardCorners = const [];
+  List<Offset> _cam2CheckerboardCorners = const [];
+  bool _checkerboardFoundCam1 = false;
+  bool _checkerboardFoundCam2 = false;
 
   String? _activeCam1Id;
   String? _activeCam2Id;
@@ -190,6 +202,9 @@ class _MultiCamPageState extends State<MultiCamPage> {
     _rectifyStereoSessionUseCase = RectifyStereoSessionUseCase(
       stereoRepository,
     );
+    _checkCheckerboardFramePairUseCase = CheckCheckerboardFramePairUseCase(
+      stereoRepository,
+    );
 
     _initialize();
   }
@@ -199,6 +214,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
     _captureTimer?.cancel();
     _stopStatsPolling();
     _stopPreviewLoop();
+    _stopCheckerboardLoop();
     _stopFotStream();
     _stopImuStreams();
 
@@ -442,30 +458,25 @@ class _MultiCamPageState extends State<MultiCamPage> {
 
       final openResult = await Camera2Bridge.openDualCameras(cam1, cam2);
       final success = openResult['success'] == true;
-      final openMode = openResult['mode'] ?? 'unknown';
+      final openMode = (openResult['mode']?.toString() ?? '').trim();
 
       if (!mounted) return;
 
       if (success) {
-        final mode = openMode.toString();
-        final modeLabel = openMode == 'logical_multi_camera'
-            ? 'Logical Multi-Camera ✓'
-            : openMode == 'alternating'
-            ? 'Alternating (sıralı çekim) ✓'
-            : '$openMode ✓';
+        const modeLabel = 'Logical Multi-Camera ✓';
         setState(() {
           _isReady = true;
           _activeCam1Id = cam1;
           _activeCam2Id = cam2;
-          _activeCaptureMode = mode;
-          _status = openMode == 'alternating'
-              ? 'Hazır! $cam1 + $cam2 ($modeLabel). Bu çiftte canlı eşzamanlı önizleme desteklenmiyor.'
-              : 'Hazır! $cam1 + $cam2 ($modeLabel).';
+          _activeCaptureMode =
+              openMode.isNotEmpty ? openMode : 'logical_multi_camera';
+          _status = 'Hazır! $cam1 + $cam2 ($modeLabel).';
           _camera2Status = '${_camera2Status.split('|').first} | $modeLabel';
         });
 
-        if (mode == 'logical_multi_camera') {
-          _startPreviewLoop();
+        _startPreviewLoop();
+        if (_phase == CaptureWorkflowPhase.calibration) {
+          _startCheckerboardLoop();
         }
       } else {
         final error = openResult['error'] ?? 'Bilinmeyen hata';
@@ -546,32 +557,8 @@ class _MultiCamPageState extends State<MultiCamPage> {
     _gyroSubscription = null;
   }
 
-  Future<void> _toggleRecording() async {
-    if (!_isReady) return;
-
-    if (_isRecording) {
-      _captureTimer?.cancel();
-      final sessionDir = _activeSessionDir;
-
-      _activeCsvFile = null;
-      _activeSessionDir = null;
-
-      if (!mounted) return;
-
-      setState(() {
-        _isRecording = false;
-        _lastCompletedSessionPath = sessionDir?.path;
-        _phase = CaptureWorkflowPhase.calibration;
-        _status =
-            'Kayıt tamamlandı. Faz 2 için checkerboard kalibrasyonunu çalıştır.';
-      });
-
-      if (_activeCaptureMode == 'logical_multi_camera') {
-        _startPreviewLoop();
-      }
-
-      return;
-    }
+  Future<void> _startRecordingSession({String? statusText}) async {
+    if (!_isReady || _isRecording) return;
 
     _stopPreviewLoop();
 
@@ -595,10 +582,84 @@ class _MultiCamPageState extends State<MultiCamPage> {
       _lastCam1PreviewBytes = null;
       _lastCam2PreviewBytes = null;
       _status =
+          statusText ??
           'Kayıt başladı | FPS: ${_fpsLabel(_settings.effectiveCaptureIntervalMs)}';
     });
 
     _startCaptureTimer();
+  }
+
+  Future<void> _stopRecordingSession({String? statusText}) async {
+    if (!_isRecording) return;
+
+    _captureTimer?.cancel();
+    final sessionDir = _activeSessionDir;
+
+    _activeCsvFile = null;
+    _activeSessionDir = null;
+
+    if (!mounted) return;
+
+    setState(() {
+      _isRecording = false;
+      _lastCompletedSessionPath = sessionDir?.path;
+      _status =
+          statusText ??
+          'Kayıt tamamlandı. Faz 2 butonu ile kalibrasyon adımına geçebilirsin.';
+    });
+
+    _startPreviewLoop();
+  }
+
+  Future<bool> _captureSessionForCalibration() async {
+    if (!_isReady) {
+      if (!mounted) return false;
+      setState(() {
+        _status = 'Faz 2 için önce kameraların hazır olması gerekiyor.';
+      });
+      return false;
+    }
+
+    if (_isAutoPhaseTransitioning) {
+      return false;
+    }
+
+    if (mounted) {
+      setState(() {
+        _isAutoPhaseTransitioning = true;
+        _status = 'Faz 2 için otomatik kayıt alınıyor...';
+      });
+    }
+
+    try {
+      if (_isRecording) {
+        await _stopRecordingSession();
+      }
+
+      await _startRecordingSession(
+        statusText:
+            'Faz 2 için otomatik kayıt başladı. Dama tahtasını iki kamerada da tutun...',
+      );
+
+      final waitDeadline = DateTime.now().add(const Duration(seconds: 12));
+      const minFrames = 14;
+      while (_frameIndex < minFrames && DateTime.now().isBefore(waitDeadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 140));
+      }
+
+      await _stopRecordingSession(
+        statusText: 'Otomatik kayıt tamamlandı. Faz 2 kalibrasyonuna geçildi.',
+      );
+
+      final sessionPath = _lastCompletedSessionPath;
+      return sessionPath != null && sessionPath.isNotEmpty;
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isAutoPhaseTransitioning = false;
+        });
+      }
+    }
   }
 
   void _startCaptureTimer() {
@@ -616,7 +677,6 @@ class _MultiCamPageState extends State<MultiCamPage> {
 
   void _startPreviewLoop() {
     if (!_isReady || _isRecording) return;
-    if (_activeCaptureMode != 'logical_multi_camera') return;
 
     _stopPreviewLoop();
     unawaited(_capturePreviewFrame());
@@ -635,9 +695,6 @@ class _MultiCamPageState extends State<MultiCamPage> {
 
   Future<void> _capturePreviewFrame() async {
     if (!_isReady || _isRecording || _isCapturing || _isPreviewCapturing) {
-      return;
-    }
-    if (_activeCaptureMode != 'logical_multi_camera') {
       return;
     }
 
@@ -676,15 +733,250 @@ class _MultiCamPageState extends State<MultiCamPage> {
     }
   }
 
-  Future<void> _runCalibrationOnDevice() async {
-    if (_isStereoProcessing) return;
-    final sessionPath = _lastCompletedSessionPath;
-    if (sessionPath == null || sessionPath.isEmpty) {
+  Future<Directory> _getPreviewCacheDir() async {
+    final cached = _previewCacheDir;
+    if (cached != null) {
+      return cached;
+    }
+
+    final tempDir = await getTemporaryDirectory();
+    final dir = Directory(
+      '${tempDir.path}${Platform.pathSeparator}multicam_preview',
+    );
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+    _previewCacheDir = dir;
+    return dir;
+  }
+
+  void _startCheckerboardLoop() {
+    if (_phase != CaptureWorkflowPhase.calibration || _isRecording) {
+      return;
+    }
+
+    _stopCheckerboardLoop();
+    unawaited(_checkCheckerboardInPreview());
+    _checkerboardTimer = Timer.periodic(
+      const Duration(milliseconds: 1200),
+      (_) => unawaited(_checkCheckerboardInPreview()),
+    );
+  }
+
+  void _stopCheckerboardLoop() {
+    _checkerboardTimer?.cancel();
+    _checkerboardTimer = null;
+  }
+
+  Future<void> _checkCheckerboardInPreview() async {
+    if (_phase != CaptureWorkflowPhase.calibration || _isStereoProcessing) {
+      return;
+    }
+    if (_isRecording || _isCheckerboardDetecting) {
+      return;
+    }
+
+    final probePaths = await _prepareCheckerboardProbePaths();
+    if (probePaths == null) {
       if (!mounted) return;
       setState(() {
-        _stereoStatus = 'Önce Faz 1 ile bir oturum kaydet.';
+        _checkerboardStatus =
+            '✗ Dama tahtası bulunamadı. Önce iki kamerada da güncel görüntü oluşmasını bekleyin.';
+        _cam1CheckerboardCorners = const [];
+        _cam2CheckerboardCorners = const [];
+        _checkerboardFoundCam1 = false;
+        _checkerboardFoundCam2 = false;
       });
       return;
+    }
+
+    _isCheckerboardDetecting = true;
+    try {
+      final result = await _checkCheckerboardFramePairUseCase(
+        probePaths.$1,
+        probePaths.$2,
+      );
+
+      final foundCam1 = result.extras['foundCam1'] == true;
+      final foundCam2 = result.extras['foundCam2'] == true;
+      final cam1Corners = _extractNormalizedCorners(
+        rawCorners: result.extras['cam1Corners'],
+        imageWidth: result.extras['cam1ImageWidth'],
+        imageHeight: result.extras['cam1ImageHeight'],
+      );
+      final cam2Corners = _extractNormalizedCorners(
+        rawCorners: result.extras['cam2Corners'],
+        imageWidth: result.extras['cam2ImageWidth'],
+        imageHeight: result.extras['cam2ImageHeight'],
+      );
+
+      final statusText = result.message.isNotEmpty
+          ? result.message
+          : (result.success
+                ? '✓ Dama tahtası bulundu.'
+                : '✗ Dama tahtası bulunamadı.');
+
+      if (!mounted) return;
+      setState(() {
+        _checkerboardStatus = statusText;
+        _checkerboardFoundCam1 = foundCam1;
+        _checkerboardFoundCam2 = foundCam2;
+        _cam1CheckerboardCorners = cam1Corners;
+        _cam2CheckerboardCorners = cam2Corners;
+      });
+    } finally {
+      _isCheckerboardDetecting = false;
+    }
+  }
+
+  List<Offset> _extractNormalizedCorners({
+    required dynamic rawCorners,
+    required dynamic imageWidth,
+    required dynamic imageHeight,
+  }) {
+    if (rawCorners is! List) {
+      return const [];
+    }
+
+    final width = _toPositiveDouble(imageWidth);
+    final height = _toPositiveDouble(imageHeight);
+    if (width <= 0 || height <= 0) {
+      return const [];
+    }
+
+    final offsets = <Offset>[];
+    for (final item in rawCorners) {
+      if (item is! Map) {
+        continue;
+      }
+
+      final x = _toPositiveDouble(item['x']);
+      final y = _toPositiveDouble(item['y']);
+      if (x < 0 || y < 0) {
+        continue;
+      }
+
+      final normalizedX = (x / width).clamp(0.0, 1.0).toDouble();
+      final normalizedY = (y / height).clamp(0.0, 1.0).toDouble();
+      offsets.add(Offset(normalizedX, normalizedY));
+    }
+
+    return offsets;
+  }
+
+  double _toPositiveDouble(dynamic value) {
+    if (value is num) {
+      return value.toDouble();
+    }
+    if (value is String) {
+      return double.tryParse(value) ?? -1;
+    }
+    return -1;
+  }
+
+  Future<(String, String)?> _prepareCheckerboardProbePaths() async {
+    final cam1Path = await _resolveProbePath(
+      bytes: _lastCam1PreviewBytes,
+      fallbackFile: _lastCam1Frame,
+      fileName: 'cam1_checkerboard_probe.jpg',
+    );
+    final cam2Path = await _resolveProbePath(
+      bytes: _lastCam2PreviewBytes,
+      fallbackFile: _lastCam2Frame,
+      fileName: 'cam2_checkerboard_probe.jpg',
+    );
+
+    if (cam1Path == null || cam2Path == null) {
+      return null;
+    }
+
+    return (cam1Path, cam2Path);
+  }
+
+  Future<String?> _resolveProbePath({
+    required Uint8List? bytes,
+    required File? fallbackFile,
+    required String fileName,
+  }) async {
+    if (bytes != null && bytes.isNotEmpty) {
+      final previewDir = await _getPreviewCacheDir();
+      final file = File('${previewDir.path}${Platform.pathSeparator}$fileName');
+      await file.writeAsBytes(bytes, flush: true);
+      return file.path;
+    }
+
+    if (fallbackFile != null && await fallbackFile.exists()) {
+      return fallbackFile.path;
+    }
+
+    return null;
+  }
+
+  Future<void> _setPhase(CaptureWorkflowPhase nextPhase) async {
+    if (_phase == nextPhase) {
+      if (_phase == CaptureWorkflowPhase.calibration) {
+        _startCheckerboardLoop();
+      }
+      return;
+    }
+
+    if (_phase == CaptureWorkflowPhase.cameraSelection &&
+        nextPhase == CaptureWorkflowPhase.calibration) {
+      final prepared = await _captureSessionForCalibration();
+      if (!prepared) {
+        if (mounted) {
+          setState(() {
+            _stereoStatus =
+                'Faz 2 otomatik kayıt tamamlanamadı. Kamerayı kontrol edip tekrar dene.';
+          });
+        }
+        return;
+      }
+    }
+
+    if (_isRecording && nextPhase != CaptureWorkflowPhase.cameraSelection) {
+      await _stopRecordingSession();
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _phase = nextPhase;
+      if (nextPhase == CaptureWorkflowPhase.calibration) {
+        _checkerboardStatus =
+            'Dama tahtası aranıyor... Kartı iki kamerada da tam görünür tutun.';
+      } else {
+        _cam1CheckerboardCorners = const [];
+        _cam2CheckerboardCorners = const [];
+        _checkerboardFoundCam1 = false;
+        _checkerboardFoundCam2 = false;
+      }
+    });
+
+    if (nextPhase == CaptureWorkflowPhase.calibration) {
+      _startCheckerboardLoop();
+    } else {
+      _stopCheckerboardLoop();
+    }
+
+    if (_isReady && !_isRecording) {
+      _startPreviewLoop();
+    }
+  }
+
+  Future<void> _runCalibrationOnDevice() async {
+    if (_isStereoProcessing) return;
+    String? sessionPath = _lastCompletedSessionPath;
+    if (sessionPath == null || sessionPath.isEmpty) {
+      final prepared = await _captureSessionForCalibration();
+      sessionPath = _lastCompletedSessionPath;
+      if (!prepared || sessionPath == null || sessionPath.isEmpty) {
+        if (!mounted) return;
+        setState(() {
+          _stereoStatus =
+              'Kalibrasyon için otomatik kayıt başarısız. Kameraları kontrol edip tekrar dene.';
+        });
+        return;
+      }
     }
 
     if (!mounted) return;
@@ -694,17 +986,24 @@ class _MultiCamPageState extends State<MultiCamPage> {
     });
 
     final result = await _calibrateStereoSessionUseCase(sessionPath);
+    final shouldAdvanceToPhase3 = result.success;
 
     if (!mounted) return;
     setState(() {
       _isStereoProcessing = false;
       _stereoStatus =
           '${result.success ? '✓' : '✗'} ${result.message} (çift: ${result.processedPairs})';
+      _checkerboardStatus = result.success
+          ? '✓ Dama tahtası bulundu. Geçerli çift: ${result.processedPairs}'
+          : '✗ Dama tahtası bulunamadı / yetersiz. ${result.message}';
       if (result.success) {
-        _phase = CaptureWorkflowPhase.stereoMatching;
         _status = 'Kalibrasyon tamamlandı. Faz 3 ile stereo rectify başlat.';
       }
     });
+
+    if (shouldAdvanceToPhase3) {
+      await _setPhase(CaptureWorkflowPhase.stereoMatching);
+    }
   }
 
   Future<void> _runRectifyOnDevice() async {
@@ -926,7 +1225,13 @@ class _MultiCamPageState extends State<MultiCamPage> {
     });
   }
 
-  Widget _buildPreview(Uint8List? previewBytes, File? lastFrame, String label) {
+  Widget _buildPreview(
+    Uint8List? previewBytes,
+    File? lastFrame,
+    String label, {
+    required List<Offset> checkerCorners,
+    required bool checkerFound,
+  }) {
     final hasPreviewBytes = previewBytes != null && previewBytes.isNotEmpty;
     final hasLastFrame = lastFrame != null && lastFrame.existsSync();
 
@@ -934,25 +1239,28 @@ class _MultiCamPageState extends State<MultiCamPage> {
       return Container(
         color: Colors.black,
         child: Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(Icons.camera_alt, color: Colors.white38, size: 48),
-              const SizedBox(height: 8),
-              Text(
-                label,
-                style: const TextStyle(color: Colors.white, fontSize: 16),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                _isRecording
-                    ? 'Yakala...'
-                    : _isReady
-                    ? 'Canlı önizleme hazırlanıyor...'
-                    : 'Bekleniyor',
-                style: const TextStyle(color: Colors.white38, fontSize: 12),
-              ),
-            ],
+          child: SingleChildScrollView(
+            physics: const NeverScrollableScrollPhysics(),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.camera_alt, color: Colors.white38, size: 40),
+                const SizedBox(height: 6),
+                Text(
+                  label,
+                  style: const TextStyle(color: Colors.white, fontSize: 14),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  _isRecording
+                      ? 'Yakala...'
+                      : _isReady
+                      ? 'Canlı önizleme hazırlanıyor...'
+                      : 'Bekleniyor',
+                  style: const TextStyle(color: Colors.white38, fontSize: 12),
+                ),
+              ],
+            ),
           ),
         ),
       );
@@ -986,6 +1294,17 @@ class _MultiCamPageState extends State<MultiCamPage> {
             ),
           ),
         ),
+        if (_phase == CaptureWorkflowPhase.calibration)
+          Positioned.fill(
+            child: IgnorePointer(
+              child: CustomPaint(
+                painter: _CheckerboardOverlayPainter(
+                  checkerCorners: checkerCorners,
+                  checkerFound: checkerFound,
+                ),
+              ),
+            ),
+          ),
       ],
     );
   }
@@ -1014,9 +1333,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
                 ),
               ),
               onPressed: () {
-                setState(() {
-                  _phase = phase;
-                });
+                unawaited(_setPhase(phase));
               },
               child: Text(
                 '${phase.shortLabel} ${phase.title}',
@@ -1164,14 +1481,27 @@ class _MultiCamPageState extends State<MultiCamPage> {
         const SizedBox(height: 6),
         _buildSelectedCameraInfo(),
         const SizedBox(height: 8),
+        const Text(
+          'Faz 2’ye geçerken gerekli kareler otomatik kaydedilir.',
+          style: TextStyle(color: Colors.white70),
+        ),
+        const SizedBox(height: 8),
         SizedBox(
           width: double.infinity,
-          child: FilledButton.icon(
-            onPressed: _isReady ? _toggleRecording : null,
-            icon: Icon(_isRecording ? Icons.stop : Icons.fiber_manual_record),
-            label: Text(_isRecording ? 'Kaydı Durdur' : 'Kaydı Başlat'),
+          child: OutlinedButton.icon(
+            onPressed: (!_isReady || _isAutoPhaseTransitioning)
+                ? null
+                : () {
+                    unawaited(_setPhase(CaptureWorkflowPhase.calibration));
+                  },
+            icon: const Icon(Icons.arrow_forward),
+            label: const Text('Faz 2’ye Geç (Kalibrasyon)'),
           ),
         ),
+        if (_isAutoPhaseTransitioning) ...[
+          const SizedBox(height: 6),
+          const LinearProgressIndicator(minHeight: 3),
+        ],
         const SizedBox(height: 6),
         Row(
           children: [
@@ -1276,28 +1606,50 @@ class _MultiCamPageState extends State<MultiCamPage> {
           style: TextStyle(color: Colors.white70),
         ),
         const SizedBox(height: 6),
+        const Text(
+          'Yönerge: 7x7 iç köşe dama tahtasını iki kamerada da tamamen görünür tutun, farklı açı/mesafelerde yavaşça hareket ettirin ve titremesiz bir kadraj sağlayın.',
+          style: TextStyle(color: Colors.white70),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          _checkerboardStatus,
+          style: TextStyle(
+            color: _checkerboardStatus.startsWith('✓')
+                ? Colors.lightGreenAccent
+                : Colors.orangeAccent,
+          ),
+        ),
+        const SizedBox(height: 6),
         Text(
           'Oturum: $sessionName',
           style: const TextStyle(color: Colors.white),
         ),
         const SizedBox(height: 8),
-        Row(
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
           children: [
-            Expanded(
-              child: FilledButton.icon(
-                onPressed: _isStereoProcessing ? null : _runCalibrationOnDevice,
-                icon: const Icon(Icons.tune),
-                label: const Text('OpenCV Kalibrasyon'),
-              ),
+            OutlinedButton.icon(
+              onPressed: _isStereoProcessing || _isCheckerboardDetecting
+                  ? null
+                  : () {
+                      unawaited(_checkCheckerboardInPreview());
+                    },
+              icon: const Icon(Icons.grid_4x4),
+              label: const Text('Dama Tahtası Ara'),
             ),
-            const SizedBox(width: 8),
+            FilledButton.icon(
+              onPressed: _isStereoProcessing ? null : _runCalibrationOnDevice,
+              icon: const Icon(Icons.tune),
+              label: const Text('OpenCV Kalibrasyon'),
+            ),
             OutlinedButton(
               onPressed: _isStereoProcessing
                   ? null
                   : () {
-                      setState(() {
-                        _phase = CaptureWorkflowPhase.cameraSelection;
-                      });
+                      unawaited(
+                        _setPhase(CaptureWorkflowPhase.cameraSelection),
+                      );
                     },
               child: const Text('Faz 1'),
             ),
@@ -1344,9 +1696,9 @@ class _MultiCamPageState extends State<MultiCamPage> {
               onPressed: _isStereoProcessing
                   ? null
                   : () {
-                      setState(() {
-                        _phase = CaptureWorkflowPhase.cameraSelection;
-                      });
+                      unawaited(
+                        _setPhase(CaptureWorkflowPhase.cameraSelection),
+                      );
                     },
               child: const Text('Faz 1'),
             ),
@@ -1376,6 +1728,8 @@ class _MultiCamPageState extends State<MultiCamPage> {
                       _lastCam1PreviewBytes,
                       _lastCam1Frame,
                       'Arka Kamera 1',
+                      checkerCorners: _cam1CheckerboardCorners,
+                      checkerFound: _checkerboardFoundCam1,
                     ),
                   ),
                 if (currentViewMode == 'Çift Kamera' ||
@@ -1385,6 +1739,8 @@ class _MultiCamPageState extends State<MultiCamPage> {
                       _lastCam2PreviewBytes,
                       _lastCam2Frame,
                       'Arka Kamera 2',
+                      checkerCorners: _cam2CheckerboardCorners,
+                      checkerFound: _checkerboardFoundCam2,
                     ),
                   ),
               ],
@@ -1430,5 +1786,86 @@ class _MultiCamPageState extends State<MultiCamPage> {
         ],
       ),
     );
+  }
+}
+
+class _CheckerboardOverlayPainter extends CustomPainter {
+  final List<Offset> checkerCorners;
+  final bool checkerFound;
+
+  const _CheckerboardOverlayPainter({
+    required this.checkerCorners,
+    required this.checkerFound,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final guideColor = checkerFound ? Colors.lightGreenAccent : Colors.white60;
+
+    final borderPaint = Paint()
+      ..color = guideColor.withOpacity(0.9)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2;
+
+    final gridPaint = Paint()
+      ..color = guideColor.withOpacity(0.35)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1;
+
+    final frameRect = Rect.fromLTWH(
+      size.width * 0.12,
+      size.height * 0.12,
+      size.width * 0.76,
+      size.height * 0.76,
+    );
+
+    canvas.drawRect(frameRect, borderPaint);
+
+    const lines = 7;
+    for (var index = 1; index < lines; index++) {
+      final dx = frameRect.left + (frameRect.width * index / lines);
+      final dy = frameRect.top + (frameRect.height * index / lines);
+      canvas.drawLine(
+        Offset(dx, frameRect.top),
+        Offset(dx, frameRect.bottom),
+        gridPaint,
+      );
+      canvas.drawLine(
+        Offset(frameRect.left, dy),
+        Offset(frameRect.right, dy),
+        gridPaint,
+      );
+    }
+
+    if (checkerCorners.isEmpty) {
+      return;
+    }
+
+    final pointPaint = Paint()
+      ..color = checkerFound
+          ? Colors.lightGreenAccent.withOpacity(0.95)
+          : Colors.orangeAccent.withOpacity(0.95)
+      ..style = PaintingStyle.fill;
+
+    for (final corner in checkerCorners) {
+      final point = Offset(corner.dx * size.width, corner.dy * size.height);
+      canvas.drawCircle(point, 2.2, pointPaint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _CheckerboardOverlayPainter oldDelegate) {
+    if (checkerFound != oldDelegate.checkerFound) {
+      return true;
+    }
+    if (checkerCorners.length != oldDelegate.checkerCorners.length) {
+      return true;
+    }
+    for (var index = 0; index < checkerCorners.length; index++) {
+      if (checkerCorners[index] != oldDelegate.checkerCorners[index]) {
+        return true;
+      }
+    }
+    return false;
   }
 }

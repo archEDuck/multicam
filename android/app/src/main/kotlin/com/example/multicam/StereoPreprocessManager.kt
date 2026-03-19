@@ -11,6 +11,7 @@ import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.MatOfPoint2f
 import org.opencv.core.MatOfPoint3f
+import org.opencv.core.Point
 import org.opencv.core.Point3
 import org.opencv.core.Size
 import org.opencv.core.TermCriteria
@@ -29,6 +30,121 @@ class StereoPreprocessManager(private val context: Context) {
 
         private const val MIN_VALID_PAIRS = 5
         private const val CALIBRATION_FILE_NAME = "stereo_calibration.json"
+    }
+
+    fun checkCheckerboard(cam1Path: String, cam2Path: String): Map<String, Any> {
+        return try {
+            ensureOpenCvLoaded()
+
+            val img1 = Imgcodecs.imread(cam1Path, Imgcodecs.IMREAD_COLOR)
+            val img2 = Imgcodecs.imread(cam2Path, Imgcodecs.IMREAD_COLOR)
+
+            if (img1.empty() || img2.empty()) {
+                img1.release()
+                img2.release()
+                return mapOf(
+                    "success" to false,
+                    "message" to "Önizleme kareleri okunamadı. Kamera görüntüsünün güncel olduğundan emin olun.",
+                    "processedPairs" to 0,
+                    "outputPath" to "",
+                )
+            }
+
+            val gray1 = Mat()
+            val gray2 = Mat()
+            Imgproc.cvtColor(img1, gray1, Imgproc.COLOR_BGR2GRAY)
+            Imgproc.cvtColor(img2, gray2, Imgproc.COLOR_BGR2GRAY)
+
+            val boardSize = Size(CHESSBOARD_WIDTH.toDouble(), CHESSBOARD_HEIGHT.toDouble())
+            val corners1 = MatOfPoint2f()
+            val corners2 = MatOfPoint2f()
+
+            val cornerCriteria = TermCriteria(
+                TermCriteria.EPS + TermCriteria.MAX_ITER,
+                30,
+                0.001,
+            )
+
+            val flags = Calib3d.CALIB_CB_ADAPTIVE_THRESH or
+                Calib3d.CALIB_CB_NORMALIZE_IMAGE
+
+            val found1 = Calib3d.findChessboardCorners(gray1, boardSize, corners1, flags)
+            val found2 = Calib3d.findChessboardCorners(gray2, boardSize, corners2, flags)
+
+            if (found1) {
+                Imgproc.cornerSubPix(
+                    gray1,
+                    corners1,
+                    Size(11.0, 11.0),
+                    Size(-1.0, -1.0),
+                    cornerCriteria,
+                )
+            }
+            if (found2) {
+                Imgproc.cornerSubPix(
+                    gray2,
+                    corners2,
+                    Size(11.0, 11.0),
+                    Size(-1.0, -1.0),
+                    cornerCriteria,
+                )
+            }
+
+            val foundPair = found1 && found2
+
+            val cam1Width = gray1.cols()
+            val cam1Height = gray1.rows()
+            val cam2Width = gray2.cols()
+            val cam2Height = gray2.rows()
+            val cam1CornerList = if (found1) cornersToList(corners1) else emptyList()
+            val cam2CornerList = if (found2) cornersToList(corners2) else emptyList()
+
+            corners1.release()
+            corners2.release()
+            gray1.release()
+            gray2.release()
+            img1.release()
+            img2.release()
+
+            val message = when {
+                foundPair -> "✓ Dama tahtası bulundu (iki kamera)."
+                found1 || found2 -> "✗ Dama tahtası iki kamerada aynı anda bulunamadı. Kartı her iki kadraja da ortalayın."
+                else -> "✗ Dama tahtası bulunamadı. Kartı kadraja yaklaştırıp daha iyi aydınlatın."
+            }
+
+            mapOf(
+                "success" to foundPair,
+                "message" to message,
+                "processedPairs" to (if (foundPair) 1 else 0),
+                "outputPath" to "",
+                "foundCam1" to found1,
+                "foundCam2" to found2,
+                "cam1Corners" to cam1CornerList,
+                "cam2Corners" to cam2CornerList,
+                "cam1ImageWidth" to cam1Width,
+                "cam1ImageHeight" to cam1Height,
+                "cam2ImageWidth" to cam2Width,
+                "cam2ImageHeight" to cam2Height,
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Checkerboard detection failed", e)
+            mapOf(
+                "success" to false,
+                "message" to (e.message ?: "Checkerboard kontrolü sırasında hata oluştu."),
+                "processedPairs" to 0,
+                "outputPath" to "",
+            )
+        }
+    }
+
+    private fun cornersToList(corners: MatOfPoint2f): List<Map<String, Double>> {
+        val points: Array<Point> = corners.toArray()
+        return points.map { point ->
+            mapOf(
+                "x" to point.x,
+                "y" to point.y,
+            )
+        }
     }
 
     fun calibrateSession(sessionDirPath: String): Map<String, Any> {
