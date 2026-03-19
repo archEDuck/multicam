@@ -10,6 +10,7 @@ import 'package:sensors_plus/sensors_plus.dart';
 
 import 'app/application/usecases/calibrate_stereo_session_use_case.dart';
 import 'app/application/usecases/check_checkerboard_frame_pair_use_case.dart';
+import 'app/application/usecases/build_depth_map_frame_pair_use_case.dart';
 import 'app/application/usecases/get_calibration_status_use_case.dart';
 import 'app/application/usecases/get_system_stats_use_case.dart';
 import 'app/application/usecases/load_app_settings_use_case.dart';
@@ -112,6 +113,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
   static const int _maxRequiredCalibrationPairs = 20;
   static const Duration _nextAngleDelay = Duration(milliseconds: 1500);
   static const Duration _liveRectifyMinInterval = Duration(milliseconds: 120);
+  static const Duration _liveDepthMinInterval = Duration(milliseconds: 220);
 
   late final SettingsController _settingsController;
   late final WarmUpSystemStatsUseCase _warmUpSystemStatsUseCase;
@@ -119,6 +121,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
   late final GetCalibrationStatusUseCase _getCalibrationStatusUseCase;
   late final CalibrateStereoSessionUseCase _calibrateStereoSessionUseCase;
   late final RectifyPreviewFramePairUseCase _rectifyPreviewFramePairUseCase;
+  late final BuildDepthMapFramePairUseCase _buildDepthMapFramePairUseCase;
   late final CheckCheckerboardFramePairUseCase
   _checkCheckerboardFramePairUseCase;
 
@@ -140,6 +143,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
   bool _isGuidedCalibrationPairCapturing = false;
   bool _isCalibrationCaptureRunning = false;
   bool _isLiveRectifyProcessing = false;
+  bool _isLiveDepthProcessing = false;
 
   String _status = 'Başlatılıyor...';
   String _camera2Status = 'Camera2 raporu hazırlanıyor...';
@@ -151,6 +155,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
   int _requiredCalibrationPairs = _defaultRequiredCalibrationPairs;
   DateTime? _lastCalibrationCaptureAt;
   DateTime? _lastLiveRectifyAt;
+  DateTime? _lastLiveDepthAt;
 
   double? _fotCm;
   int _frameIndex = 0;
@@ -173,8 +178,9 @@ class _MultiCamPageState extends State<MultiCamPage> {
   Uint8List? _lastCam2PreviewBytes;
   Uint8List? _rectifiedCam1PreviewBytes;
   Uint8List? _rectifiedCam2PreviewBytes;
+  Uint8List? _depthPreviewBytes;
   bool _showRectifiedPreview = false;
-  bool _showEpipolarLines = false;
+  bool _showDepthPreview = false;
   File? _lastCam1Frame;
   File? _lastCam2Frame;
   Directory? _previewCacheDir;
@@ -222,6 +228,9 @@ class _MultiCamPageState extends State<MultiCamPage> {
       stereoRepository,
     );
     _rectifyPreviewFramePairUseCase = RectifyPreviewFramePairUseCase(
+      stereoRepository,
+    );
+    _buildDepthMapFramePairUseCase = BuildDepthMapFramePairUseCase(
       stereoRepository,
     );
     _checkCheckerboardFramePairUseCase = CheckCheckerboardFramePairUseCase(
@@ -473,7 +482,9 @@ class _MultiCamPageState extends State<MultiCamPage> {
       _lastCam2PreviewBytes = null;
       _rectifiedCam1PreviewBytes = null;
       _rectifiedCam2PreviewBytes = null;
+      _depthPreviewBytes = null;
       _showRectifiedPreview = false;
+      _showDepthPreview = false;
       _lastCam1Frame = null;
       _lastCam2Frame = null;
       _status = 'Kameralar açılıyor ($cam1, $cam2)...';
@@ -799,6 +810,20 @@ class _MultiCamPageState extends State<MultiCamPage> {
           cam2Bytes.isNotEmpty) {
         unawaited(
           _refreshLiveRectifyFromPreview(
+            cam1Bytes: cam1Bytes,
+            cam2Bytes: cam2Bytes,
+          ),
+        );
+      }
+
+      if (_phase == CaptureWorkflowPhase.depthMap &&
+          _showDepthPreview &&
+          cam1Bytes is Uint8List &&
+          cam2Bytes is Uint8List &&
+          cam1Bytes.isNotEmpty &&
+          cam2Bytes.isNotEmpty) {
+        unawaited(
+          _refreshLiveDepthFromPreview(
             cam1Bytes: cam1Bytes,
             cam2Bytes: cam2Bytes,
           ),
@@ -1151,9 +1176,12 @@ class _MultiCamPageState extends State<MultiCamPage> {
       _phase = nextPhase;
       if (nextPhase != CaptureWorkflowPhase.stereoMatching) {
         _showRectifiedPreview = false;
-        _showEpipolarLines = false;
         _rectifiedCam1PreviewBytes = null;
         _rectifiedCam2PreviewBytes = null;
+      }
+      if (nextPhase != CaptureWorkflowPhase.depthMap) {
+        _showDepthPreview = false;
+        _depthPreviewBytes = null;
       }
       if (nextPhase == CaptureWorkflowPhase.calibration) {
         _isCalibrationCaptureRunning = false;
@@ -1165,6 +1193,9 @@ class _MultiCamPageState extends State<MultiCamPage> {
         _checkerboardStatus =
             'Hazır. Kayda başlamak için "Çekimi Başlat" butonuna basın (0/$_requiredCalibrationPairs).';
         _status = 'Faz 2 hazır.';
+      } else if (nextPhase == CaptureWorkflowPhase.depthMap) {
+        _status =
+            'Faz 4 hazır. Canlı derinlik haritası için "Canlı Derinlik Başlat" butonuna basın.';
       } else {
         _isCalibrationCaptureRunning = false;
         _cam1CheckerboardCorners = const [];
@@ -1239,9 +1270,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
       if (!mounted) return;
       setState(() {
         _showRectifiedPreview = false;
-        _showEpipolarLines = false;
-        _status = 'Canlı rectify durduruldu.';
-        _stereoStatus = 'Canlı rectify durduruldu.';
+        _stereoStatus = '';
       });
       return;
     }
@@ -1278,7 +1307,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
     if (!mounted) return;
     setState(() {
       _isStereoProcessing = true;
-      _stereoStatus = 'Canlı rectify başlatılıyor...';
+      _stereoStatus = '';
     });
 
     final result = await _rectifyPreviewFramePairUseCase(cam1Bytes, cam2Bytes);
@@ -1294,16 +1323,12 @@ class _MultiCamPageState extends State<MultiCamPage> {
       _isStereoProcessing = false;
       _showRectifiedPreview = result.success && hasRectifiedPair;
       if (_showRectifiedPreview) {
-        _showEpipolarLines = false;
         _rectifiedCam1PreviewBytes = pair.$1;
         _rectifiedCam2PreviewBytes = pair.$2;
-        _status =
-            'Canlı rectify aktif. Faz 3 önizlemesi rectified sol/sağ video akışı gösteriyor.';
+        _stereoStatus = '';
       } else {
-        _showEpipolarLines = false;
+        _stereoStatus = '✗ ${result.message}';
       }
-      _stereoStatus =
-          '${_showRectifiedPreview ? '✓' : '✗'} ${result.message}';
     });
   }
 
@@ -1354,6 +1379,115 @@ class _MultiCamPageState extends State<MultiCamPage> {
     } finally {
       _isLiveRectifyProcessing = false;
     }
+  }
+
+  Future<void> _runDepthMapOnDevice() async {
+    if (_isStereoProcessing || _isLiveDepthProcessing) return;
+
+    if (_showDepthPreview) {
+      if (!mounted) return;
+      setState(() {
+        _showDepthPreview = false;
+        _depthPreviewBytes = null;
+        _stereoStatus = '';
+      });
+      return;
+    }
+
+    Uint8List? cam1Bytes = _lastCam1PreviewBytes;
+    Uint8List? cam2Bytes = _lastCam2PreviewBytes;
+
+    final hasInitialFrames =
+        cam1Bytes != null &&
+        cam2Bytes != null &&
+        cam1Bytes.isNotEmpty &&
+        cam2Bytes.isNotEmpty;
+
+    if (!hasInitialFrames && _isReady && !_isRecording) {
+      await _capturePreviewFrame();
+      cam1Bytes = _lastCam1PreviewBytes;
+      cam2Bytes = _lastCam2PreviewBytes;
+    }
+
+    final canStartLiveDepth =
+        cam1Bytes != null &&
+        cam2Bytes != null &&
+        cam1Bytes.isNotEmpty &&
+        cam2Bytes.isNotEmpty;
+    if (!canStartLiveDepth) {
+      if (!mounted) return;
+      setState(() {
+        _stereoStatus =
+            'Canlı derinlik için iki kameradan güncel preview karesi gerekli.';
+      });
+      return;
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _isStereoProcessing = true;
+      _stereoStatus = '';
+    });
+
+    final result = await _buildDepthMapFramePairUseCase(cam1Bytes, cam2Bytes);
+    final depthBytes = _extractDepthPreview(result);
+    final hasDepthPreview =
+        depthBytes != null && depthBytes.isNotEmpty && result.success;
+
+    if (!mounted) return;
+    setState(() {
+      _isStereoProcessing = false;
+      _showDepthPreview = hasDepthPreview;
+      _depthPreviewBytes = hasDepthPreview ? depthBytes : null;
+      _stereoStatus = hasDepthPreview ? '' : '✗ ${result.message}';
+    });
+  }
+
+  Future<void> _refreshLiveDepthFromPreview({
+    required Uint8List cam1Bytes,
+    required Uint8List cam2Bytes,
+  }) async {
+    if (_phase != CaptureWorkflowPhase.depthMap || !_showDepthPreview) {
+      return;
+    }
+    if (_isStereoProcessing || _isLiveDepthProcessing) {
+      return;
+    }
+
+    final now = DateTime.now();
+    if (_lastLiveDepthAt != null &&
+        now.difference(_lastLiveDepthAt!) < _liveDepthMinInterval) {
+      return;
+    }
+
+    _isLiveDepthProcessing = true;
+    _lastLiveDepthAt = now;
+    try {
+      final result = await _buildDepthMapFramePairUseCase(cam1Bytes, cam2Bytes);
+      if (!mounted) return;
+
+      if (!result.success) {
+        setState(() {
+          _stereoStatus = '✗ ${result.message}';
+        });
+        return;
+      }
+
+      final depthBytes = _extractDepthPreview(result);
+      if (depthBytes == null || depthBytes.isEmpty) {
+        return;
+      }
+
+      setState(() {
+        _depthPreviewBytes = depthBytes;
+      });
+    } finally {
+      _isLiveDepthProcessing = false;
+    }
+  }
+
+  Uint8List? _extractDepthPreview(StereoPreprocessResult result) {
+    return _asUint8List(result.extras['depthBytes']);
   }
 
   (Uint8List?, Uint8List?) _extractRectifiedPreviewPair(
@@ -1433,6 +1567,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
         calibrationExists ? 'rectify_' : 'calib_',
       CaptureWorkflowPhase.calibration => 'calib_',
       CaptureWorkflowPhase.stereoMatching => 'rectify_',
+      CaptureWorkflowPhase.depthMap => 'depth_',
     };
 
     final timestamp = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
@@ -1569,7 +1704,6 @@ class _MultiCamPageState extends State<MultiCamPage> {
     String label, {
     required List<Offset> checkerCorners,
     required bool checkerFound,
-    required bool showEpipolarLines,
   }) {
     final hasPreviewBytes = previewBytes != null && previewBytes.isNotEmpty;
     final hasLastFrame = lastFrame != null && lastFrame.existsSync();
@@ -1644,15 +1778,54 @@ class _MultiCamPageState extends State<MultiCamPage> {
               ),
             ),
           ),
-        if (showEpipolarLines)
-          const Positioned.fill(
-            child: IgnorePointer(
-              child: CustomPaint(
-                painter: _EpipolarHorizontalOverlayPainter(),
+      ],
+    );
+  }
+
+  Widget _buildDepthPreview() {
+    final depthBytes = _depthPreviewBytes;
+    final hasDepth = depthBytes != null && depthBytes.isNotEmpty;
+
+    return Container(
+      color: Colors.black,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          if (hasDepth)
+            Image.memory(
+              depthBytes,
+              fit: BoxFit.contain,
+              gaplessPlayback: true,
+              filterQuality: FilterQuality.low,
+            )
+          else
+            Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: const [
+                  Icon(Icons.blur_on, color: Colors.white38, size: 42),
+                  SizedBox(height: 8),
+                  Text(
+                    'Canlı derinlik haritası bekleniyor...',
+                    style: TextStyle(color: Colors.white54),
+                  ),
+                ],
+              ),
+            ),
+          Positioned(
+            top: 8,
+            left: 8,
+            child: Container(
+              color: Colors.black54,
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              child: const Text(
+                'Derinlik Haritası',
+                style: TextStyle(color: Colors.white, fontSize: 14),
               ),
             ),
           ),
-      ],
+        ],
+      ),
     );
   }
 
@@ -1817,6 +1990,8 @@ class _MultiCamPageState extends State<MultiCamPage> {
         return _buildPhaseTwoContent();
       case CaptureWorkflowPhase.stereoMatching:
         return _buildPhaseThreeContent();
+      case CaptureWorkflowPhase.depthMap:
+        return _buildPhaseFourContent();
     }
   }
 
@@ -2127,11 +2302,6 @@ class _MultiCamPageState extends State<MultiCamPage> {
             'Çıktı: $_lastRectifiedOutputPath',
             style: const TextStyle(color: Colors.lightGreenAccent),
           ),
-        if (_showRectifiedPreview)
-          const Text(
-            'Önizleme: Sol/Sağ pencerede rectified görüntü gösteriliyor.',
-            style: TextStyle(color: Colors.lightGreenAccent),
-          ),
         const SizedBox(height: 8),
         Row(
           children: [
@@ -2163,23 +2333,53 @@ class _MultiCamPageState extends State<MultiCamPage> {
             ),
           ],
         ),
+      ],
+    );
+  }
+
+  Widget _buildPhaseFourContent() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'Stereo görüntü işleme ile canlı derinlik haritası üretilir.',
+          style: TextStyle(color: Colors.white70),
+        ),
+        const SizedBox(height: 6),
+        const Text(
+          'Isınmayı azaltmak için derinlik hesabı düşük çözünürlükte ve aralıklı çalışır.',
+          style: TextStyle(color: Colors.white54, fontSize: 12),
+        ),
         const SizedBox(height: 8),
-        OutlinedButton.icon(
-          onPressed: _isStereoProcessing || !_showRectifiedPreview
-              ? null
-              : () {
-                  setState(() {
-                    _showEpipolarLines = !_showEpipolarLines;
-                  });
-                },
-          icon: Icon(
-            _showEpipolarLines ? Icons.visibility_off : Icons.visibility,
-          ),
-          label: Text(
-            _showEpipolarLines
-                ? 'Epipolar Çizgileri Kapat'
-                : 'Epipolar Çizgileri Aç',
-          ),
+        Row(
+          children: [
+            Expanded(
+              child: FilledButton.icon(
+                onPressed: _isStereoProcessing ? null : _runDepthMapOnDevice,
+                icon: Icon(
+                  _showDepthPreview
+                      ? Icons.pause_circle_outline
+                      : Icons.blur_on,
+                ),
+                label: Text(
+                  _showDepthPreview
+                      ? 'Canlı Derinlik Durdur'
+                      : 'Canlı Derinlik Başlat',
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            OutlinedButton(
+              onPressed: _isStereoProcessing
+                  ? null
+                  : () {
+                      unawaited(
+                        _setPhase(CaptureWorkflowPhase.cameraSelection),
+                      );
+                    },
+              child: const Text('Faz 1'),
+            ),
+          ],
         ),
       ],
     );
@@ -2189,16 +2389,14 @@ class _MultiCamPageState extends State<MultiCamPage> {
   Widget build(BuildContext context) {
     final currentViewMode = _settings.effectiveViewMode;
     final showRectifiedInPreview =
-      _phase == CaptureWorkflowPhase.stereoMatching &&
-      _showRectifiedPreview;
-    final showEpipolarInPreview =
-      showRectifiedInPreview && _showEpipolarLines;
+        _phase == CaptureWorkflowPhase.stereoMatching &&
+        _showRectifiedPreview;
     final cam1PreviewBytes = showRectifiedInPreview
-      ? (_rectifiedCam1PreviewBytes ?? _lastCam1PreviewBytes)
-      : _lastCam1PreviewBytes;
+        ? (_rectifiedCam1PreviewBytes ?? _lastCam1PreviewBytes)
+        : _lastCam1PreviewBytes;
     final cam2PreviewBytes = showRectifiedInPreview
-      ? (_rectifiedCam2PreviewBytes ?? _lastCam2PreviewBytes)
-      : _lastCam2PreviewBytes;
+        ? (_rectifiedCam2PreviewBytes ?? _lastCam2PreviewBytes)
+        : _lastCam2PreviewBytes;
 
     return Scaffold(
       appBar: AppBar(
@@ -2207,34 +2405,34 @@ class _MultiCamPageState extends State<MultiCamPage> {
       body: Column(
         children: [
           Expanded(
-            child: Row(
-              children: [
-                if (currentViewMode == 'Çift Kamera' ||
-                    currentViewMode == 'Tek Kamera (Kam 1)')
-                  Expanded(
-                    child: _buildPreview(
-                      cam1PreviewBytes,
-                      _lastCam1Frame,
-                      'Arka Kamera 1',
-                      checkerCorners: _cam1CheckerboardCorners,
-                      checkerFound: _checkerboardFoundCam1,
-                      showEpipolarLines: showEpipolarInPreview,
-                    ),
+            child: _phase == CaptureWorkflowPhase.depthMap
+                ? _buildDepthPreview()
+                : Row(
+                    children: [
+                      if (currentViewMode == 'Çift Kamera' ||
+                          currentViewMode == 'Tek Kamera (Kam 1)')
+                        Expanded(
+                          child: _buildPreview(
+                            cam1PreviewBytes,
+                            _lastCam1Frame,
+                            'Arka Kamera 1',
+                            checkerCorners: _cam1CheckerboardCorners,
+                            checkerFound: _checkerboardFoundCam1,
+                          ),
+                        ),
+                      if (currentViewMode == 'Çift Kamera' ||
+                          currentViewMode == 'Tek Kamera (Kam 2)')
+                        Expanded(
+                          child: _buildPreview(
+                            cam2PreviewBytes,
+                            _lastCam2Frame,
+                            'Arka Kamera 2',
+                            checkerCorners: _cam2CheckerboardCorners,
+                            checkerFound: _checkerboardFoundCam2,
+                          ),
+                        ),
+                    ],
                   ),
-                if (currentViewMode == 'Çift Kamera' ||
-                    currentViewMode == 'Tek Kamera (Kam 2)')
-                  Expanded(
-                    child: _buildPreview(
-                      cam2PreviewBytes,
-                      _lastCam2Frame,
-                      'Arka Kamera 2',
-                      checkerCorners: _cam2CheckerboardCorners,
-                      checkerFound: _checkerboardFoundCam2,
-                      showEpipolarLines: showEpipolarInPreview,
-                    ),
-                  ),
-              ],
-            ),
           ),
           if (_settings.effectiveEnableStats)
             MulticamStatsBar(stats: _systemStats, actualFps: _actualFps),
@@ -2314,29 +2512,6 @@ class _CheckerboardOverlayPainter extends CustomPainter {
         return true;
       }
     }
-    return false;
-  }
-}
-
-class _EpipolarHorizontalOverlayPainter extends CustomPainter {
-  const _EpipolarHorizontalOverlayPainter();
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final linePaint = Paint()
-      ..color = Colors.cyanAccent.withOpacity(0.75)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1;
-
-    const lineCount = 12;
-    for (var index = 1; index < lineCount; index++) {
-      final y = size.height * index / lineCount;
-      canvas.drawLine(Offset(0, y), Offset(size.width, y), linePaint);
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant _EpipolarHorizontalOverlayPainter oldDelegate) {
     return false;
   }
 }

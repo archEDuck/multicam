@@ -6,10 +6,12 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.opencv.android.OpenCVLoader
 import org.opencv.calib3d.Calib3d
+import org.opencv.calib3d.StereoBM
 import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.MatOfByte
+import org.opencv.core.MatOfInt
 import org.opencv.core.MatOfPoint2f
 import org.opencv.core.MatOfPoint3f
 import org.opencv.core.Point
@@ -35,6 +37,10 @@ class StereoPreprocessManager(private val context: Context) {
 
         private const val MIN_VALID_PAIRS = 5
         private const val CALIBRATION_FILE_NAME = "stereo_calibration.json"
+        private const val DEPTH_DOWNSCALE = 0.5
+        private const val DEPTH_BLOCK_SIZE = 15
+        private const val DEPTH_TARGET_NUM_DISPARITIES = 96
+        private const val DEPTH_JPEG_QUALITY = 72
     }
 
     private data class CheckerboardSpec(
@@ -76,6 +82,8 @@ class StereoPreprocessManager(private val context: Context) {
     )
 
     private var cachedRectifyMaps: RectifyMaps? = null
+    private var cachedStereoBm: StereoBM? = null
+    private var cachedStereoBmNumDisparities: Int = -1
 
     fun checkCheckerboard(cam1Path: String, cam2Path: String): Map<String, Any> {
         return try {
@@ -302,6 +310,144 @@ class StereoPreprocessManager(private val context: Context) {
             mapOf(
                 "success" to false,
                 "message" to (e.message ?: "Canlı rectify sırasında hata oluştu."),
+                "processedPairs" to 0,
+                "outputPath" to "",
+            )
+        }
+    }
+
+    fun depthFramePair(cam1Bytes: ByteArray, cam2Bytes: ByteArray): Map<String, Any> {
+        return try {
+            ensureOpenCvLoaded()
+
+            if (cam1Bytes.isEmpty() || cam2Bytes.isEmpty()) {
+                return mapOf(
+                    "success" to false,
+                    "message" to "Canlı derinlik için iki kamera önizleme karesi gerekli.",
+                    "processedPairs" to 0,
+                    "outputPath" to "",
+                )
+            }
+
+            val calibrationFile = calibrationOutputFile()
+            if (!calibrationFile.exists()) {
+                return mapOf(
+                    "success" to false,
+                    "message" to "Kalibrasyon dosyası bulunamadı. Önce Faz 2 kalibrasyonu çalıştırın.",
+                    "processedPairs" to 0,
+                    "outputPath" to "",
+                )
+            }
+
+            val rectifyMaps = getOrCreateRectifyMaps(calibrationFile)
+                ?: return mapOf(
+                    "success" to false,
+                    "message" to "Kalibrasyon verisi okunamadı veya bozuk.",
+                    "processedPairs" to 0,
+                    "outputPath" to calibrationFile.absolutePath,
+                )
+
+            val encoded1 = MatOfByte(*cam1Bytes)
+            val encoded2 = MatOfByte(*cam2Bytes)
+            val src1 = Imgcodecs.imdecode(encoded1, Imgcodecs.IMREAD_COLOR)
+            val src2 = Imgcodecs.imdecode(encoded2, Imgcodecs.IMREAD_COLOR)
+            encoded1.release()
+            encoded2.release()
+
+            if (src1.empty() || src2.empty()) {
+                src1.release()
+                src2.release()
+                return mapOf(
+                    "success" to false,
+                    "message" to "Önizleme kareleri decode edilemedi.",
+                    "processedPairs" to 0,
+                    "outputPath" to calibrationFile.absolutePath,
+                )
+            }
+
+            if (src1.size() != rectifyMaps.imageSize) {
+                Imgproc.resize(src1, src1, rectifyMaps.imageSize)
+            }
+            if (src2.size() != rectifyMaps.imageSize) {
+                Imgproc.resize(src2, src2, rectifyMaps.imageSize)
+            }
+
+            val rect1 = Mat()
+            val rect2 = Mat()
+            Imgproc.remap(src1, rect1, rectifyMaps.map1x, rectifyMaps.map1y, Imgproc.INTER_LINEAR)
+            Imgproc.remap(src2, rect2, rectifyMaps.map2x, rectifyMaps.map2y, Imgproc.INTER_LINEAR)
+
+            val gray1 = Mat()
+            val gray2 = Mat()
+            Imgproc.cvtColor(rect1, gray1, Imgproc.COLOR_BGR2GRAY)
+            Imgproc.cvtColor(rect2, gray2, Imgproc.COLOR_BGR2GRAY)
+
+            val depthSize = depthProcessingSize(rectifyMaps.imageSize)
+            val smallGray1 = Mat()
+            val smallGray2 = Mat()
+            Imgproc.resize(gray1, smallGray1, depthSize, 0.0, 0.0, Imgproc.INTER_AREA)
+            Imgproc.resize(gray2, smallGray2, depthSize, 0.0, 0.0, Imgproc.INTER_AREA)
+
+            val disparity16 = Mat()
+            val stereoBm = getOrCreateStereoBm(smallGray1.cols())
+            stereoBm.compute(smallGray1, smallGray2, disparity16)
+
+            val disparity32 = Mat()
+            disparity16.convertTo(disparity32, CvType.CV_32F, 1.0 / 16.0)
+            Imgproc.threshold(disparity32, disparity32, 0.0, 0.0, Imgproc.THRESH_TOZERO)
+
+            val disparity8 = Mat()
+            Core.normalize(disparity32, disparity8, 0.0, 255.0, Core.NORM_MINMAX, CvType.CV_8U)
+
+            val depthColor = Mat()
+            Imgproc.applyColorMap(disparity8, depthColor, Imgproc.COLORMAP_TURBO)
+            if (depthColor.size() != rectifyMaps.imageSize) {
+                Imgproc.resize(depthColor, depthColor, rectifyMaps.imageSize, 0.0, 0.0, Imgproc.INTER_LINEAR)
+            }
+
+            val outDepth = MatOfByte()
+            val encodeParams = MatOfInt(Imgcodecs.IMWRITE_JPEG_QUALITY, DEPTH_JPEG_QUALITY)
+            val ok = Imgcodecs.imencode(".jpg", depthColor, outDepth, encodeParams)
+            val depthBytes = if (ok) outDepth.toArray() else ByteArray(0)
+
+            outDepth.release()
+            encodeParams.release()
+            src1.release()
+            src2.release()
+            rect1.release()
+            rect2.release()
+            gray1.release()
+            gray2.release()
+            smallGray1.release()
+            smallGray2.release()
+            disparity16.release()
+            disparity32.release()
+            disparity8.release()
+            depthColor.release()
+
+            if (!ok || depthBytes.isEmpty()) {
+                return mapOf(
+                    "success" to false,
+                    "message" to "Canlı derinlik çıktısı üretilemedi.",
+                    "processedPairs" to 0,
+                    "outputPath" to calibrationFile.absolutePath,
+                )
+            }
+
+            mapOf(
+                "success" to true,
+                "message" to "Canlı derinlik aktif.",
+                "processedPairs" to 1,
+                "outputPath" to calibrationFile.absolutePath,
+                "depthBytes" to depthBytes,
+                "imageWidth" to rectifyMaps.imageSize.width.toInt(),
+                "imageHeight" to rectifyMaps.imageSize.height.toInt(),
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Live depth map failed", e)
+            mapOf(
+                "success" to false,
+                "message" to (e.message ?: "Canlı derinlik sırasında hata oluştu."),
                 "processedPairs" to 0,
                 "outputPath" to "",
             )
@@ -715,6 +861,33 @@ class StereoPreprocessManager(private val context: Context) {
         maps?.map1y?.release()
         maps?.map2x?.release()
         maps?.map2y?.release()
+    }
+
+    private fun depthProcessingSize(sourceSize: Size): Size {
+        val scaledWidth = (sourceSize.width * DEPTH_DOWNSCALE).toInt().coerceAtLeast(160)
+        val scaledHeight = (sourceSize.height * DEPTH_DOWNSCALE).toInt().coerceAtLeast(120)
+        return Size(scaledWidth.toDouble(), scaledHeight.toDouble())
+    }
+
+    private fun getOrCreateStereoBm(imageWidth: Int): StereoBM {
+        val maxByWidth = ((imageWidth / 16) * 16).coerceAtLeast(16)
+        val numDisparities = minOf(DEPTH_TARGET_NUM_DISPARITIES, maxByWidth)
+
+        if (cachedStereoBm != null && cachedStereoBmNumDisparities == numDisparities) {
+            return checkNotNull(cachedStereoBm)
+        }
+
+        val stereoBm = StereoBM.create(numDisparities, DEPTH_BLOCK_SIZE)
+        stereoBm.setPreFilterCap(31)
+        stereoBm.setTextureThreshold(8)
+        stereoBm.setUniquenessRatio(12)
+        stereoBm.setSpeckleWindowSize(80)
+        stereoBm.setSpeckleRange(16)
+        stereoBm.setDisp12MaxDiff(1)
+
+        cachedStereoBm = stereoBm
+        cachedStereoBmNumDisparities = numDisparities
+        return stereoBm
     }
 
     private fun checkerboardSpecs(): List<CheckerboardSpec> {
