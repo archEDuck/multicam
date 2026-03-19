@@ -7,7 +7,7 @@ void main() {
     await tester.pumpWidget(const MyApp());
     await tester.pumpAndSettle();
 
-    expect(find.text('Multicam Capture (S23)'), findsOneWidget);
-    expect(find.text('Kaydi Baslat'), findsOneWidget);
+    expect(find.textContaining('Stereo Pipeline'), findsOneWidget);
+    expect(find.text('Kaydı Başlat'), findsOneWidget);
   });
 }

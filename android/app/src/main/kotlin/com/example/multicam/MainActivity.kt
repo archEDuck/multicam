@@ -2,12 +2,15 @@ package com.example.multicam
 
 import android.app.ActivityManager
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Debug
 import io.flutter.embedding.android.FlutterActivity
@@ -22,6 +25,7 @@ class MainActivity : FlutterActivity() {
 	private val camera2BridgeChannel = "multicam/camera2_bridge"
 	private val dualCameraChannel = "multicam/dual_camera"
 	private val systemStatsChannel = "multicam/system_stats"
+	private val stereoPreprocessChannel = "multicam/stereo_preprocess"
 
 	override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
 		super.configureFlutterEngine(flutterEngine)
@@ -37,6 +41,9 @@ class MainActivity : FlutterActivity() {
 
 		MethodChannel(flutterEngine.dartExecutor.binaryMessenger, systemStatsChannel)
 			.setMethodCallHandler(SystemStatsHandler(this))
+
+		MethodChannel(flutterEngine.dartExecutor.binaryMessenger, stereoPreprocessChannel)
+			.setMethodCallHandler(StereoPreprocessHandler(this))
 	}
 }
 
@@ -105,6 +112,53 @@ private class DualCameraHandler(
 			"getCameraStatus" -> {
 				runOnBackground(result) {
 					dualCameraManager.getStatus()
+				}
+			}
+
+			else -> result.notImplemented()
+		}
+	}
+}
+
+private class StereoPreprocessHandler(
+	context: Context,
+) : MethodChannel.MethodCallHandler {
+	private val manager = StereoPreprocessManager(context)
+	private val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+	private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+	private fun runOnBackground(result: MethodChannel.Result, block: () -> Any?) {
+		executor.execute {
+			try {
+				val value = block()
+				mainHandler.post { result.success(value) }
+			} catch (e: Exception) {
+				mainHandler.post { result.error("STEREO_PREPROCESS_ERROR", e.message, null) }
+			}
+		}
+	}
+
+	override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
+		when (call.method) {
+			"calibrateSession" -> {
+				val sessionDir = call.argument<String>("sessionDir")
+				if (sessionDir.isNullOrBlank()) {
+					result.error("INVALID_ARGS", "sessionDir is required", null)
+					return
+				}
+				runOnBackground(result) {
+					manager.calibrateSession(sessionDir)
+				}
+			}
+
+			"rectifySession" -> {
+				val sessionDir = call.argument<String>("sessionDir")
+				if (sessionDir.isNullOrBlank()) {
+					result.error("INVALID_ARGS", "sessionDir is required", null)
+					return
+				}
+				runOnBackground(result) {
+					manager.rectifySession(sessionDir)
 				}
 			}
 
@@ -249,7 +303,7 @@ private class FotSensorStreamHandler(
  * Provides system stats (CPU usage, RAM usage) via MethodChannel.
  */
 private class SystemStatsHandler(
-	context: Context,
+	private val context: Context,
 ) : MethodChannel.MethodCallHandler {
 	private val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
 	private var lastCpuIdle: Long = 0
@@ -269,35 +323,7 @@ private class SystemStatsHandler(
 	}
 
 	private fun buildStats(): Map<String, Any> {
-		// --- CPU usage from /proc/stat ---
-		var cpuPercent = 0.0
-		try {
-			val reader = RandomAccessFile("/proc/stat", "r")
-			val line = reader.readLine() // first line: cpu  user nice system idle ...
-			reader.close()
-
-			val parts = line.split("\\s+".toRegex())
-			// parts[0]="cpu", parts[1..]=user, nice, system, idle, iowait, irq, softirq, ...
-			if (parts.size >= 5) {
-				var total = 0L
-				for (i in 1 until parts.size) {
-					total += parts[i].toLongOrNull() ?: 0
-				}
-				val idle = parts[4].toLongOrNull() ?: 0
-
-				if (lastCpuTotal > 0) {
-					val diffTotal = total - lastCpuTotal
-					val diffIdle = idle - lastCpuIdle
-					if (diffTotal > 0) {
-						cpuPercent = ((diffTotal - diffIdle).toDouble() / diffTotal) * 100.0
-					}
-				}
-				lastCpuTotal = total
-				lastCpuIdle = idle
-			}
-		} catch (_: Exception) {
-			cpuPercent = -1.0
-		}
+		val cpuPercent = readCpuPercent()
 
 		// --- RAM usage ---
 		val memInfo = ActivityManager.MemoryInfo()
@@ -311,14 +337,63 @@ private class SystemStatsHandler(
 		val rt = Runtime.getRuntime()
 		val appHeapMB = (rt.totalMemory() - rt.freeMemory()) / (1024.0 * 1024.0)
 		val nativeHeapMB = Debug.getNativeHeapAllocatedSize() / (1024.0 * 1024.0)
+		val batteryTempC = readBatteryTemperatureC()
 
 		return mapOf(
-			"cpuPercent" to String.format("%.1f", cpuPercent).toDouble(),
-			"totalRamMB" to String.format("%.0f", totalRamMB).toDouble(),
-			"availRamMB" to String.format("%.0f", availRamMB).toDouble(),
-			"usedRamMB" to String.format("%.0f", usedRamMB).toDouble(),
-			"appHeapMB" to String.format("%.1f", appHeapMB).toDouble(),
-			"appNativeMB" to String.format("%.1f", nativeHeapMB).toDouble(),
+			"cpuPercent" to cpuPercent,
+			"totalRamMB" to totalRamMB,
+			"availRamMB" to availRamMB,
+			"usedRamMB" to usedRamMB,
+			"appHeapMB" to appHeapMB,
+			"appNativeMB" to nativeHeapMB,
+			"batteryTempC" to batteryTempC,
 		)
+	}
+
+	private fun readCpuPercent(): Double {
+		return try {
+			val line = RandomAccessFile("/proc/stat", "r").use { it.readLine() }
+				?: return -1.0
+
+			val parts = line.trim().split("\\s+".toRegex())
+			// parts[0]="cpu", parts[1..]=user, nice, system, idle, iowait, irq, softirq, ...
+			if (parts.size < 5 || parts[0] != "cpu") {
+				return -1.0
+			}
+
+			var total = 0L
+			for (i in 1 until parts.size) {
+				total += parts[i].toLongOrNull() ?: 0L
+			}
+			val idle = parts[4].toLongOrNull() ?: 0L
+
+			val cpuPercent = if (lastCpuTotal > 0) {
+				val diffTotal = total - lastCpuTotal
+				val diffIdle = idle - lastCpuIdle
+				if (diffTotal > 0) {
+					((diffTotal - diffIdle).toDouble() / diffTotal) * 100.0
+				} else {
+					0.0
+				}
+			} else {
+				0.0
+			}
+
+			lastCpuTotal = total
+			lastCpuIdle = idle
+			cpuPercent.coerceIn(0.0, 100.0)
+		} catch (_: Exception) {
+			-1.0
+		}
+	}
+
+	private fun readBatteryTemperatureC(): Double {
+		val batteryIntent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+		val tenthsC = batteryIntent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE)
+		return if (tenthsC == null || tenthsC == Int.MIN_VALUE) {
+			-1.0
+		} else {
+			tenthsC / 10.0
+		}
 	}
 }

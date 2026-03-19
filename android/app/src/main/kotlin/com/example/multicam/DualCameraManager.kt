@@ -681,7 +681,7 @@ class DualCameraManager(private val context: Context) {
                     val iso = result.get(CaptureResult.SENSOR_SENSITIVITY)
                     val gains = result.get(CaptureResult.COLOR_CORRECTION_GAINS)
                     
-                    if (expTime != null) latestExposureMs = String.format("%.2f", expTime / 1000000.0)
+                        if (expTime != null) latestExposureMs = java.lang.String.format(java.util.Locale.US, "%.2f", expTime / 1000000.0)
                     if (iso != null) latestIso = iso.toString()
                     if (gains != null) latestKelvin = estimateCCT(gains)
                 }
