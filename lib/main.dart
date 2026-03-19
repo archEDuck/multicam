@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -41,6 +42,52 @@ class MyApp extends StatelessWidget {
       ),
       home: const MultiCamPage(),
     );
+  }
+}
+
+class _CameraOption {
+  final String id;
+  final String lensType;
+  final double megapixels;
+  final double focalMm;
+  final String displayName;
+
+  const _CameraOption({
+    required this.id,
+    required this.lensType,
+    required this.megapixels,
+    required this.focalMm,
+    required this.displayName,
+  });
+
+  factory _CameraOption.fromMap(Map<dynamic, dynamic> map) {
+    double toDouble(dynamic value) {
+      if (value is num) return value.toDouble();
+      if (value is String) return double.tryParse(value) ?? 0;
+      return 0;
+    }
+
+    final id = (map['id']?.toString() ?? '').trim();
+    final lensType = (map['lensType']?.toString() ?? '').trim();
+    final megapixels = toDouble(map['megapixels']);
+    final focalMm = toDouble(map['focalMm']);
+    final displayName = (map['displayName']?.toString() ?? '').trim();
+
+    return _CameraOption(
+      id: id,
+      lensType: lensType,
+      megapixels: megapixels,
+      focalMm: focalMm,
+      displayName: displayName,
+    );
+  }
+
+  String get compactLabel {
+    if (displayName.isNotEmpty) return displayName;
+    final mpText = megapixels > 0 ? '${megapixels.toStringAsFixed(1)}MP' : '-';
+    final focalText = focalMm > 0 ? '${focalMm.toStringAsFixed(1)}mm' : '-';
+    final lensText = lensType.isNotEmpty ? lensType : 'Back';
+    return '$lensText • $mpText • $focalText • id=$id';
   }
 }
 
@@ -97,17 +144,17 @@ class _MultiCamPageState extends State<MultiCamPage> {
   Directory? _activeSessionDir;
 
   List<String> _availableBackCameraIds = [];
+  Map<String, _CameraOption> _cameraOptionsById = {};
   String? _cam1Id;
   String? _cam2Id;
+  Uint8List? _lastCam1PreviewBytes;
+  Uint8List? _lastCam2PreviewBytes;
   File? _lastCam1Frame;
   File? _lastCam2Frame;
-  int _cam1FrameKey = 0;
-  int _cam2FrameKey = 0;
-  int _previewFrameIndex = 0;
 
   String? _activeCam1Id;
   String? _activeCam2Id;
-  Directory? _previewDir;
+  String _activeCaptureMode = '';
 
   String? _lastCompletedSessionPath;
   String? _lastRectifiedOutputPath;
@@ -271,17 +318,15 @@ class _MultiCamPageState extends State<MultiCamPage> {
   Future<void> _initDualCameras() async {
     try {
       final report = await Camera2Bridge.getBackCameraReport();
-      final backCameraIds =
-          (report['backCameraIds'] as List?)
-              ?.map((item) => item.toString())
-              .toList() ??
-          <String>[];
+      final cameraOptions = _parseBackCameraOptions(report);
+      final backCameraIds = cameraOptions.map((item) => item.id).toList();
 
       if (!mounted) return;
       setState(() {
+        _cameraOptionsById = {for (final item in cameraOptions) item.id: item};
         _availableBackCameraIds = backCameraIds;
         _camera2Status =
-            'Camera2: ${backCameraIds.length} arka kamera bulundu (${backCameraIds.join(', ')})';
+            'Camera2: ${backCameraIds.length} seçilebilir arka kamera bulundu.';
       });
 
       if (backCameraIds.length < 2) {
@@ -322,6 +367,39 @@ class _MultiCamPageState extends State<MultiCamPage> {
     }
   }
 
+  List<_CameraOption> _parseBackCameraOptions(Map<String, dynamic> report) {
+    final rawOptions = report['backCameraOptions'];
+    if (rawOptions is List) {
+      final parsed = rawOptions
+          .whereType<Map>()
+          .map((item) => _CameraOption.fromMap(item))
+          .where((item) => item.id.isNotEmpty)
+          .toList();
+      if (parsed.isNotEmpty) {
+        return parsed;
+      }
+    }
+
+    final fallbackIds =
+        (report['backCameraIds'] as List?)
+            ?.map((item) => item.toString())
+            .where((item) => item.isNotEmpty)
+            .toList() ??
+        <String>[];
+
+    return fallbackIds
+        .map(
+          (id) => _CameraOption(
+            id: id,
+            lensType: 'Back',
+            megapixels: 0,
+            focalMm: 0,
+            displayName: 'Back • id=$id',
+          ),
+        )
+        .toList();
+  }
+
   Future<void> _openSelectedCameras(String cam1, String cam2) async {
     if (cam1 == cam2) {
       if (!mounted) return;
@@ -344,9 +422,6 @@ class _MultiCamPageState extends State<MultiCamPage> {
     _isOpeningCameras = true;
     _stopPreviewLoop();
 
-    var openedSuccessfully = false;
-    var openedMode = '';
-
     if (!mounted) {
       _isOpeningCameras = false;
       return;
@@ -355,6 +430,8 @@ class _MultiCamPageState extends State<MultiCamPage> {
       _isReady = false;
       _cam1Id = cam1;
       _cam2Id = cam2;
+      _lastCam1PreviewBytes = null;
+      _lastCam2PreviewBytes = null;
       _lastCam1Frame = null;
       _lastCam2Frame = null;
       _status = 'Kameralar açılıyor ($cam1, $cam2)...';
@@ -366,12 +443,11 @@ class _MultiCamPageState extends State<MultiCamPage> {
       final openResult = await Camera2Bridge.openDualCameras(cam1, cam2);
       final success = openResult['success'] == true;
       final openMode = openResult['mode'] ?? 'unknown';
-      openedMode = openMode.toString();
 
       if (!mounted) return;
 
       if (success) {
-        openedSuccessfully = true;
+        final mode = openMode.toString();
         final modeLabel = openMode == 'logical_multi_camera'
             ? 'Logical Multi-Camera ✓'
             : openMode == 'alternating'
@@ -381,17 +457,23 @@ class _MultiCamPageState extends State<MultiCamPage> {
           _isReady = true;
           _activeCam1Id = cam1;
           _activeCam2Id = cam2;
-          _status = 'Hazır! $cam1 + $cam2 ($modeLabel).';
+          _activeCaptureMode = mode;
+          _status = openMode == 'alternating'
+              ? 'Hazır! $cam1 + $cam2 ($modeLabel). Bu çiftte canlı eşzamanlı önizleme desteklenmiyor.'
+              : 'Hazır! $cam1 + $cam2 ($modeLabel).';
           _camera2Status = '${_camera2Status.split('|').first} | $modeLabel';
         });
 
-        _startPreviewLoop();
+        if (mode == 'logical_multi_camera') {
+          _startPreviewLoop();
+        }
       } else {
         final error = openResult['error'] ?? 'Bilinmeyen hata';
         setState(() {
           _isReady = false;
           _activeCam1Id = null;
           _activeCam2Id = null;
+          _activeCaptureMode = '';
           _status = 'Dual kamera açılamadı: $error';
           _camera2Status += ' ✗ $error';
         });
@@ -402,51 +484,12 @@ class _MultiCamPageState extends State<MultiCamPage> {
         _isReady = false;
         _activeCam1Id = null;
         _activeCam2Id = null;
+        _activeCaptureMode = '';
         _status = 'Dual kamera açılış hatası: $e';
       });
     } finally {
       _isOpeningCameras = false;
     }
-
-    if (openedSuccessfully && openedMode == 'alternating') {
-      await _tryRecoverFromAlternatingMode(
-        attemptedCam1: cam1,
-        attemptedCam2: cam2,
-      );
-    }
-  }
-
-  Future<void> _tryRecoverFromAlternatingMode({
-    required String attemptedCam1,
-    required String attemptedCam2,
-  }) async {
-    if (!mounted || _isRecording || _isOpeningCameras) return;
-
-    final pairResult = await Camera2Bridge.findBestPair();
-    if (!mounted) return;
-
-    final found = pairResult['found'] == true;
-    final mode = (pairResult['mode'] ?? '').toString();
-    final bestCam1 = pairResult['cam1Id']?.toString();
-    final bestCam2 = pairResult['cam2Id']?.toString();
-
-    if (found &&
-        mode == 'logical_multi_camera' &&
-        bestCam1 != null &&
-        bestCam2 != null &&
-        (bestCam1 != attemptedCam1 || bestCam2 != attemptedCam2)) {
-      setState(() {
-        _status =
-            'Seçilen çift senkron değil. En iyi senkron çifte geçiliyor ($bestCam1, $bestCam2)...';
-      });
-      await _openSelectedCameras(bestCam1, bestCam2);
-      return;
-    }
-
-    setState(() {
-      _status =
-          'Seçilen çift alternating modda açıldı. Canlı eşzamanlı görüntü için farklı bir çift seç.';
-    });
   }
 
   void _startFotStream() {
@@ -523,6 +566,10 @@ class _MultiCamPageState extends State<MultiCamPage> {
             'Kayıt tamamlandı. Faz 2 için checkerboard kalibrasyonunu çalıştır.';
       });
 
+      if (_activeCaptureMode == 'logical_multi_camera') {
+        _startPreviewLoop();
+      }
+
       return;
     }
 
@@ -545,6 +592,8 @@ class _MultiCamPageState extends State<MultiCamPage> {
 
     setState(() {
       _isRecording = true;
+      _lastCam1PreviewBytes = null;
+      _lastCam2PreviewBytes = null;
       _status =
           'Kayıt başladı | FPS: ${_fpsLabel(_settings.effectiveCaptureIntervalMs)}';
     });
@@ -565,29 +614,14 @@ class _MultiCamPageState extends State<MultiCamPage> {
     );
   }
 
-  Future<Directory> _ensurePreviewDirectory() async {
-    if (_previewDir != null) {
-      return _previewDir!;
-    }
-
-    final base = await getApplicationDocumentsDirectory();
-    final dir = Directory(
-      '${base.path}${Platform.pathSeparator}preview_frames',
-    );
-    if (!await dir.exists()) {
-      await dir.create(recursive: true);
-    }
-    _previewDir = dir;
-    return dir;
-  }
-
   void _startPreviewLoop() {
     if (!_isReady || _isRecording) return;
+    if (_activeCaptureMode != 'logical_multi_camera') return;
 
     _stopPreviewLoop();
     unawaited(_capturePreviewFrame());
 
-    final intervalMs = _settings.effectiveCaptureIntervalMs.clamp(250, 1200);
+    final intervalMs = _settings.effectiveCaptureIntervalMs.clamp(80, 250);
     _previewTimer = Timer.periodic(
       Duration(milliseconds: intervalMs),
       (_) => unawaited(_capturePreviewFrame()),
@@ -603,43 +637,36 @@ class _MultiCamPageState extends State<MultiCamPage> {
     if (!_isReady || _isRecording || _isCapturing || _isPreviewCapturing) {
       return;
     }
+    if (_activeCaptureMode != 'logical_multi_camera') {
+      return;
+    }
 
     _isPreviewCapturing = true;
     try {
-      final dir = await _ensurePreviewDirectory();
-      final slot = _previewFrameIndex % 2;
-      _previewFrameIndex += 1;
-
-      final cam1Path =
-          '${dir.path}${Platform.pathSeparator}preview_cam1_$slot.jpg';
-      final cam2Path =
-          '${dir.path}${Platform.pathSeparator}preview_cam2_$slot.jpg';
-
-      final result = await Camera2Bridge.captureDualFrame(cam1Path, cam2Path);
+      final result = await Camera2Bridge.getLatestPreviewFrames();
       if (!mounted) return;
 
-      final cam1Saved = result['cam1Saved'] == true;
-      final cam2Saved = result['cam2Saved'] == true;
+      final mode = (result['capture_mode']?.toString() ?? '').trim();
+      if (mode.isNotEmpty && mode != _activeCaptureMode) {
+        _activeCaptureMode = mode;
+      }
 
-      if (!cam1Saved && !cam2Saved) {
+      final cam1Bytes = result['cam1Bytes'];
+      final cam2Bytes = result['cam2Bytes'];
+
+      final cam1HasData = cam1Bytes is Uint8List && cam1Bytes.isNotEmpty;
+      final cam2HasData = cam2Bytes is Uint8List && cam2Bytes.isNotEmpty;
+
+      if (!cam1HasData && !cam2HasData) {
         return;
       }
 
-      if (cam1Saved) {
-        await FileImage(File(cam1Path)).evict();
-      }
-      if (cam2Saved) {
-        await FileImage(File(cam2Path)).evict();
-      }
-
       setState(() {
-        if (cam1Saved) {
-          _lastCam1Frame = File(cam1Path);
-          _cam1FrameKey += 1;
+        if (cam1HasData) {
+          _lastCam1PreviewBytes = cam1Bytes;
         }
-        if (cam2Saved) {
-          _lastCam2Frame = File(cam2Path);
-          _cam2FrameKey += 1;
+        if (cam2HasData) {
+          _lastCam2PreviewBytes = cam2Bytes;
         }
       });
     } catch (_) {
@@ -832,13 +859,11 @@ class _MultiCamPageState extends State<MultiCamPage> {
       if (cam1Saved && mounted) {
         setState(() {
           _lastCam1Frame = File(cam1FullPath);
-          _cam1FrameKey++;
         });
       }
       if (cam2Saved && mounted) {
         setState(() {
           _lastCam2Frame = File(cam2FullPath);
-          _cam2FrameKey++;
         });
       }
 
@@ -901,8 +926,11 @@ class _MultiCamPageState extends State<MultiCamPage> {
     });
   }
 
-  Widget _buildPreview(File? lastFrame, int frameKey, String label) {
-    if (lastFrame == null || !lastFrame.existsSync()) {
+  Widget _buildPreview(Uint8List? previewBytes, File? lastFrame, String label) {
+    final hasPreviewBytes = previewBytes != null && previewBytes.isNotEmpty;
+    final hasLastFrame = lastFrame != null && lastFrame.existsSync();
+
+    if (!hasPreviewBytes && !hasLastFrame) {
       return Container(
         color: Colors.black,
         child: Center(
@@ -932,12 +960,20 @@ class _MultiCamPageState extends State<MultiCamPage> {
     return Stack(
       fit: StackFit.expand,
       children: [
-        Image.file(
-          lastFrame,
-          key: ValueKey('${label}_$frameKey'),
-          fit: BoxFit.cover,
-          gaplessPlayback: true,
-        ),
+        if (hasPreviewBytes)
+          Image.memory(
+            previewBytes,
+            fit: BoxFit.cover,
+            gaplessPlayback: true,
+            filterQuality: FilterQuality.low,
+          )
+        else
+          Image.file(
+            lastFrame!,
+            fit: BoxFit.cover,
+            gaplessPlayback: true,
+            filterQuality: FilterQuality.low,
+          ),
         Positioned(
           top: 8,
           left: 8,
@@ -1073,9 +1109,39 @@ class _MultiCamPageState extends State<MultiCamPage> {
         underline: const SizedBox.shrink(),
         onChanged: _isRecording ? null : onChanged,
         items: _availableBackCameraIds.map((id) {
-          return DropdownMenuItem(value: id, child: Text('$label: $id'));
+          final option = _cameraOptionsById[id];
+          final text = option?.compactLabel ?? 'Back • id=$id';
+          return DropdownMenuItem(
+            value: id,
+            child: Text('$label: $text', overflow: TextOverflow.ellipsis),
+          );
         }).toList(),
       ),
+    );
+  }
+
+  Widget _buildSelectedCameraInfo() {
+    final cam1 = _cam1Id == null ? null : _cameraOptionsById[_cam1Id!];
+    final cam2 = _cam2Id == null ? null : _cameraOptionsById[_cam2Id!];
+
+    if (cam1 == null && cam2 == null) {
+      return const SizedBox.shrink();
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (cam1 != null)
+          Text(
+            'Kamera 1: ${cam1.compactLabel}',
+            style: const TextStyle(color: Colors.white70, fontSize: 12),
+          ),
+        if (cam2 != null)
+          Text(
+            'Kamera 2: ${cam2.compactLabel}',
+            style: const TextStyle(color: Colors.white70, fontSize: 12),
+          ),
+      ],
     );
   }
 
@@ -1095,6 +1161,8 @@ class _MultiCamPageState extends State<MultiCamPage> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _buildCameraDropdowns(),
+        const SizedBox(height: 6),
+        _buildSelectedCameraInfo(),
         const SizedBox(height: 8),
         SizedBox(
           width: double.infinity,
@@ -1305,8 +1373,8 @@ class _MultiCamPageState extends State<MultiCamPage> {
                     currentViewMode == 'Tek Kamera (Kam 1)')
                   Expanded(
                     child: _buildPreview(
+                      _lastCam1PreviewBytes,
                       _lastCam1Frame,
-                      _cam1FrameKey,
                       'Arka Kamera 1',
                     ),
                   ),
@@ -1314,8 +1382,8 @@ class _MultiCamPageState extends State<MultiCamPage> {
                     currentViewMode == 'Tek Kamera (Kam 2)')
                   Expanded(
                     child: _buildPreview(
+                      _lastCam2PreviewBytes,
                       _lastCam2Frame,
-                      _cam2FrameKey,
                       'Arka Kamera 2',
                     ),
                   ),

@@ -4,6 +4,7 @@ import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.Sensor
@@ -19,6 +20,8 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.io.RandomAccessFile
+import java.util.Locale
+import kotlin.math.roundToInt
 
 class MainActivity : FlutterActivity() {
 	private val fotChannel = "multicam/fot_sensor"
@@ -99,6 +102,12 @@ private class DualCameraHandler(
 				}
 				runOnBackground(result) {
 					dualCameraManager.captureDualFrame(cam1Path, cam2Path)
+				}
+			}
+
+			"getLatestPreviewFrames" -> {
+				runOnBackground(result) {
+					dualCameraManager.getLatestPreviewFrames()
 				}
 			}
 
@@ -188,60 +197,140 @@ private class Camera2BridgeHandler(
 	}
 
 	private fun buildBackCameraReport(): Map<String, Any> {
-		val cameras = mutableListOf<Map<String, Any>>()
-		val backIds = mutableListOf<String>()
-		val allIdsToInspect = mutableSetOf<String>()
-		
-		for (id in cameraManager.cameraIdList) {
-			allIdsToInspect.add(id)
+		val logicalBackIds = mutableSetOf<String>()
+		val physicalBackIds = mutableSetOf<String>()
+
+		for (cameraId in cameraManager.cameraIdList) {
+			val chars = cameraManager.getCameraCharacteristics(cameraId)
+			if (chars.get(CameraCharacteristics.LENS_FACING) != CameraCharacteristics.LENS_FACING_BACK) {
+				continue
+			}
+
+			logicalBackIds.add(cameraId)
 			if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-				try {
-					val characteristics = cameraManager.getCameraCharacteristics(id)
-					for (physicalId in characteristics.physicalCameraIds) {
-						allIdsToInspect.add(physicalId)
+				for (physicalId in chars.physicalCameraIds) {
+					if (isBackCamera(physicalId)) {
+						physicalBackIds.add(physicalId)
 					}
-				} catch (e: Exception) {
 				}
 			}
 		}
 
-		for (cameraId in allIdsToInspect) {
-			val characteristics = cameraManager.getCameraCharacteristics(cameraId)
-			val lensFacing = characteristics.get(CameraCharacteristics.LENS_FACING)
-			if (lensFacing == CameraCharacteristics.LENS_FACING_BACK) {
-				if (!backIds.contains(cameraId)) {
-					backIds.add(cameraId)
-				}
+		val inspectIds = (if (physicalBackIds.isNotEmpty()) physicalBackIds else logicalBackIds)
+			.toList()
+			.sorted()
+
+		val rawBackOptions = mutableListOf<MutableMap<String, Any>>()
+
+		for (cameraId in inspectIds) {
+			val chars = cameraManager.getCameraCharacteristics(cameraId)
+			if (chars.get(CameraCharacteristics.LENS_FACING) != CameraCharacteristics.LENS_FACING_BACK) {
+				continue
 			}
 
-			val capabilities = characteristics
+			val capabilities = chars
 				.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
 				?.toList()
 				?: emptyList()
-			val focalLengths = characteristics
-				.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
-				?.map { it.toDouble() }
-				?: emptyList()
 
-			cameras.add(
-				mapOf(
+			val streamMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+			val jpegSizes = streamMap?.getOutputSizes(ImageFormat.JPEG)?.toList() ?: emptyList()
+			val hasJpegOutput = jpegSizes.isNotEmpty()
+			val isBackwardCompatible = capabilities.contains(
+				CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_BACKWARD_COMPATIBLE,
+			)
+			val colorFilter = chars.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) ?: -1
+			val isMono = colorFilter == CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_MONO
+
+			if (!hasJpegOutput || !isBackwardCompatible || isMono) {
+				continue
+			}
+
+			val focalMm = chars
+				.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+				?.minOrNull()
+				?.toDouble()
+				?: 0.0
+			if (focalMm <= 0.0) {
+				continue
+			}
+
+			val pixelArray = chars.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
+			val megapixels = if (pixelArray != null) {
+				(pixelArray.width.toDouble() * pixelArray.height.toDouble()) / 1_000_000.0
+			} else {
+				0.0
+			}
+
+			val sensorSize = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+			val minFocusDistance = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
+			val oisModes = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+			val hasOis = oisModes?.contains(CameraCharacteristics.LENS_OPTICAL_STABILIZATION_MODE_ON) == true
+
+			rawBackOptions.add(
+				mutableMapOf(
 					"id" to cameraId,
-					"isBack" to (lensFacing == CameraCharacteristics.LENS_FACING_BACK),
-					"hardwareLevel" to (characteristics.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)
+					"focalMm" to focalMm,
+					"megapixels" to megapixels,
+					"hardwareLevel" to (chars.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)
 						?: -1),
-					"capabilities" to capabilities,
-					"focalLengths" to focalLengths,
+					"hardwareLevelName" to hardwareLevelName(
+						chars.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL) ?: -1,
+					),
+					"supportsLogicalMultiCamera" to capabilities.contains(
+						CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA,
+					),
 					"supportsDepthOutput" to capabilities.contains(
 						CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_DEPTH_OUTPUT,
 					),
+					"supportsRaw" to capabilities.contains(
+						CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW,
+					),
+					"hasOis" to hasOis,
+					"minFocusDistance" to (minFocusDistance?.toDouble() ?: -1.0),
+					"pixelArrayWidth" to (pixelArray?.width ?: 0),
+					"pixelArrayHeight" to (pixelArray?.height ?: 0),
+					"sensorPhysicalWidthMm" to (sensorSize?.width?.toDouble() ?: 0.0),
+					"sensorPhysicalHeightMm" to (sensorSize?.height?.toDouble() ?: 0.0),
+					"maxJpegWidth" to (jpegSizes.maxOfOrNull { it.width } ?: 0),
+					"maxJpegHeight" to (jpegSizes.maxOfOrNull { it.height } ?: 0),
 				),
 			)
 		}
 
+		val dedupedBackOptions = rawBackOptions
+			.groupBy { ((it["focalMm"] as Double) * 10.0).roundToInt() }
+			.map { (_, group) -> group.maxByOrNull { (it["megapixels"] as Double) }!! }
+			.sortedBy { it["focalMm"] as Double }
+
+		val mainFocalMm = if (dedupedBackOptions.isNotEmpty()) {
+			dedupedBackOptions[dedupedBackOptions.size / 2]["focalMm"] as Double
+		} else {
+			1.0
+		}
+
+		for (option in dedupedBackOptions) {
+			val focal = option["focalMm"] as Double
+			val mp = option["megapixels"] as Double
+			val lensType = classifyLensType(focal, mainFocalMm)
+			option["lensType"] = lensType
+			option["displayName"] = String.format(
+				Locale.US,
+				"%s • %.1fMP • %.1fmm • id=%s",
+				lensType,
+				mp,
+				focal,
+				option["id"],
+			)
+		}
+
+		val filteredBackIds = dedupedBackOptions.map { it["id"].toString() }
+		val selectableIdSet = filteredBackIds.toSet()
+
 		val concurrentBackPairs = mutableListOf<List<String>>()
 		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
 			for (group in cameraManager.concurrentCameraIds) {
-				val backInGroup = group.filter { isBackCamera(it) }
+				val backInGroup = group.filter { selectableIdSet.contains(it) }
 				if (backInGroup.size >= 2) {
 					for (i in 0 until backInGroup.size - 1) {
 						for (j in i + 1 until backInGroup.size) {
@@ -254,10 +343,32 @@ private class Camera2BridgeHandler(
 
 		return mapOf(
 			"apiLevel" to Build.VERSION.SDK_INT,
-			"backCameraIds" to backIds,
+			"backCameraIds" to filteredBackIds,
+			"rawBackCameraIds" to inspectIds,
 			"concurrentBackCameraPairs" to concurrentBackPairs,
-			"cameras" to cameras,
+			"backCameraOptions" to dedupedBackOptions,
 		)
+	}
+
+	private fun classifyLensType(focalMm: Double, mainFocalMm: Double): String {
+		val ratio = if (mainFocalMm > 0.0) focalMm / mainFocalMm else 1.0
+		return when {
+			ratio < 0.72 -> "Ultra Wide"
+			ratio > 2.2 -> "Periscope Tele"
+			ratio > 1.35 -> "Tele"
+			else -> "Wide/Main"
+		}
+	}
+
+	private fun hardwareLevelName(level: Int): String {
+		return when (level) {
+			CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LEGACY -> "LEGACY"
+			CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LIMITED -> "LIMITED"
+			CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_FULL -> "FULL"
+			CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_3 -> "LEVEL_3"
+			CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_EXTERNAL -> "EXTERNAL"
+			else -> "UNKNOWN"
+		}
 	}
 
 	private fun isBackCamera(cameraId: String): Boolean {

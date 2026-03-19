@@ -338,7 +338,7 @@ class DualCameraManager(private val context: Context) {
             }
         }
 
-        return findLogicalMultiCamera()
+        return null
     }
 
     @SuppressLint("MissingPermission")
@@ -565,6 +565,47 @@ class DualCameraManager(private val context: Context) {
         }
 
         return result
+    }
+
+    fun getLatestPreviewFrames(): Map<String, Any> {
+        if (!isOpen) {
+            return mapOf(
+                "success" to false,
+                "error" to "Not open",
+                "cam1Bytes" to ByteArray(0),
+                "cam2Bytes" to ByteArray(0),
+                "capture_mode" to "",
+            )
+        }
+
+        val mode = when (captureMode) {
+            CaptureMode.LOGICAL_MULTI_CAMERA -> "logical_multi_camera"
+            CaptureMode.ALTERNATING -> "alternating"
+            else -> ""
+        }
+
+        if (captureMode != CaptureMode.LOGICAL_MULTI_CAMERA) {
+            return mapOf(
+                "success" to false,
+                "error" to "Live preview is only available in logical multi-camera mode",
+                "cam1Bytes" to ByteArray(0),
+                "cam2Bytes" to ByteArray(0),
+                "cam1Id" to (physicalId1 ?: altCam1Id ?: ""),
+                "cam2Id" to (physicalId2 ?: altCam2Id ?: ""),
+                "capture_mode" to mode,
+            )
+        }
+
+        val bytes1 = latestBytes1
+        val bytes2 = latestBytes2
+        return mapOf(
+            "success" to (bytes1 != null || bytes2 != null),
+            "cam1Bytes" to (bytes1 ?: ByteArray(0)),
+            "cam2Bytes" to (bytes2 ?: ByteArray(0)),
+            "cam1Id" to (physicalId1 ?: altCam1Id ?: ""),
+            "cam2Id" to (physicalId2 ?: altCam2Id ?: ""),
+            "capture_mode" to mode,
+        )
     }
 
     /**

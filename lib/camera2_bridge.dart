@@ -47,6 +47,15 @@ class Camera2Bridge {
     return _asStringKeyedMap(raw);
   }
 
+  /// Returns latest preview frames from native in-memory buffers.
+  /// cam1Bytes/cam2Bytes are Uint8List-compatible byte arrays when available.
+  static Future<Map<String, dynamic>> getLatestPreviewFrames() async {
+    final dynamic raw = await _dualChannel.invokeMethod(
+      'getLatestPreviewFrames',
+    );
+    return _asStringKeyedMap(raw);
+  }
+
   /// Closes both camera sessions and releases resources.
   static Future<void> closeDualCameras() async {
     await _dualChannel.invokeMethod('closeDualCameras');
