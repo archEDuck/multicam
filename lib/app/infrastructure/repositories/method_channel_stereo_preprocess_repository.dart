@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter/services.dart';
 
 import '../../domain/entities/stereo_preprocess_result.dart';
@@ -41,6 +43,42 @@ class MethodChannelStereoPreprocessRepository
       );
     } catch (e) {
       return StereoPreprocessResult.empty('Rectify hatası: $e');
+    }
+  }
+
+  @override
+  Future<StereoPreprocessResult> rectifyFramePair(
+    Uint8List cam1Bytes,
+    Uint8List cam2Bytes,
+  ) async {
+    try {
+      final dynamic raw = await _channel.invokeMethod('rectifyFramePair', {
+        'cam1Bytes': cam1Bytes,
+        'cam2Bytes': cam2Bytes,
+      });
+      if (raw is Map) {
+        return StereoPreprocessResult.fromMap(raw);
+      }
+      return StereoPreprocessResult.empty(
+        'Canlı rectify sonucu okunamadı (boş yanıt).',
+      );
+    } catch (e) {
+      return StereoPreprocessResult.empty('Canlı rectify hatası: $e');
+    }
+  }
+
+  @override
+  Future<StereoPreprocessResult> getCalibrationStatus() async {
+    try {
+      final dynamic raw = await _channel.invokeMethod('getCalibrationStatus');
+      if (raw is Map) {
+        return StereoPreprocessResult.fromMap(raw);
+      }
+      return StereoPreprocessResult.empty(
+        'Kalibrasyon durumu okunamadı (boş yanıt).',
+      );
+    } catch (e) {
+      return StereoPreprocessResult.empty('Kalibrasyon durumu hatası: $e');
     }
   }
 
