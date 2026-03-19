@@ -43,11 +43,17 @@ class StereoPreprocessManager(private val context: Context) {
         private const val CALIBRATION_FILE_NAME = "stereo_calibration.json"
         private const val DEPTH_JPEG_QUALITY = 72
         private const val DEPTH_MODEL_ASSET_PATH =
-            "flutter_assets/assets/foundation_stereo_cleaned_fp32.onnx"
+            "flutter_assets/assets/foundation_stereo_int8.onnx"
         private const val DEPTH_MODEL_ASSET_FALLBACK =
-            "assets/foundation_stereo_cleaned_fp32.onnx"
+            "assets/foundation_stereo_int8.onnx"
         private const val DEPTH_MODEL_DIRECT_ASSET =
-            "foundation_stereo_cleaned_fp32.onnx"
+            "foundation_stereo_int8.onnx"
+        private const val DEPTH_MODEL_CACHE_DIR = "models"
+        private const val DEPTH_MODEL_CACHE_VERSION = 2
+        private const val DEPTH_MODEL_CACHE_VERSION_FILE = "foundation_stereo_int8.onnx.version"
+        private const val MODEL_COPY_BUFFER_BYTES = 64 * 1024
+        private const val MAX_DEPTH_INPUT_PIXELS = 1920 * 1080
+        private const val MAX_DEPTH_OUTPUT_PIXELS = 1920 * 1080
     }
 
     private data class CheckerboardSpec(
@@ -108,10 +114,45 @@ class StereoPreprocessManager(private val context: Context) {
         val rightInput: DepthInputTensorSpec,
         val output: DepthOutputTensorSpec,
         val backendLabel: String,
+        val modelPath: String,
     )
 
     private var cachedRectifyMaps: RectifyMaps? = null
     private var cachedDepthModelRuntime: DepthModelRuntime? = null
+
+    fun releaseDepthModelRuntime(reason: String = "manual"): Map<String, Any> {
+        val existing = cachedDepthModelRuntime
+        if (existing == null) {
+            return mapOf(
+                "success" to true,
+                "message" to "Depth model zaten kapalı.",
+                "released" to false,
+                "reason" to reason,
+            )
+        }
+
+        return try {
+            existing.session.close()
+            cachedDepthModelRuntime = null
+            mapOf(
+                "success" to true,
+                "message" to "Depth model kapatıldı.",
+                "released" to true,
+                "reason" to reason,
+                "backend" to existing.backendLabel,
+                "modelPath" to existing.modelPath,
+            )
+        } catch (e: Throwable) {
+            cachedDepthModelRuntime = null
+            mapOf(
+                "success" to false,
+                "message" to (e.message ?: "Depth model kapatılırken hata oluştu."),
+                "released" to false,
+                "reason" to reason,
+                "errorType" to e.javaClass.name,
+            )
+        }
+    }
 
     fun checkCheckerboard(cam1Path: String, cam2Path: String): Map<String, Any> {
         return try {
@@ -345,6 +386,7 @@ class StereoPreprocessManager(private val context: Context) {
     }
 
     fun depthFramePair(cam1Bytes: ByteArray, cam2Bytes: ByteArray): Map<String, Any> {
+        val totalStartNs = System.nanoTime()
         return try {
             ensureOpenCvLoaded()
 
@@ -354,6 +396,7 @@ class StereoPreprocessManager(private val context: Context) {
                     "message" to "Canlı derinlik için iki kamera önizleme karesi gerekli.",
                     "processedPairs" to 0,
                     "outputPath" to "",
+                    "stage" to "validation",
                 )
             }
 
@@ -364,6 +407,7 @@ class StereoPreprocessManager(private val context: Context) {
                     "message" to "Kalibrasyon dosyası bulunamadı. Önce Faz 2 kalibrasyonu çalıştırın.",
                     "processedPairs" to 0,
                     "outputPath" to "",
+                    "stage" to "validation",
                 )
             }
 
@@ -373,6 +417,7 @@ class StereoPreprocessManager(private val context: Context) {
                     "message" to "Kalibrasyon verisi okunamadı veya bozuk.",
                     "processedPairs" to 0,
                     "outputPath" to calibrationFile.absolutePath,
+                    "stage" to "rectify_maps",
                 )
 
             val encoded1 = MatOfByte(*cam1Bytes)
@@ -390,6 +435,7 @@ class StereoPreprocessManager(private val context: Context) {
                     "message" to "Önizleme kareleri decode edilemedi.",
                     "processedPairs" to 0,
                     "outputPath" to calibrationFile.absolutePath,
+                    "stage" to "decode",
                 )
             }
 
@@ -402,89 +448,105 @@ class StereoPreprocessManager(private val context: Context) {
 
             val rect1 = Mat()
             val rect2 = Mat()
-            Imgproc.remap(src1, rect1, rectifyMaps.map1x, rectifyMaps.map1y, Imgproc.INTER_LINEAR)
-            Imgproc.remap(src2, rect2, rectifyMaps.map2x, rectifyMaps.map2y, Imgproc.INTER_LINEAR)
+            try {
+                Imgproc.remap(src1, rect1, rectifyMaps.map1x, rectifyMaps.map1y, Imgproc.INTER_LINEAR)
+                Imgproc.remap(src2, rect2, rectifyMaps.map2x, rectifyMaps.map2y, Imgproc.INTER_LINEAR)
 
-            val runtime = getOrCreateDepthModelRuntime()
-            if (
-                runtime.leftInput.width != runtime.rightInput.width ||
-                    runtime.leftInput.height != runtime.rightInput.height
-            ) {
+                val runtime = getOrCreateDepthModelRuntime()
+                if (
+                    runtime.leftInput.width != runtime.rightInput.width ||
+                        runtime.leftInput.height != runtime.rightInput.height
+                ) {
+                    return mapOf(
+                        "success" to false,
+                        "message" to "Model giriş tensor boyutları eşleşmiyor.",
+                        "processedPairs" to 0,
+                        "outputPath" to calibrationFile.absolutePath,
+                        "stage" to "runtime_validation",
+                        "backend" to runtime.backendLabel,
+                        "modelPath" to runtime.modelPath,
+                    )
+                }
+
+                val leftTensor = buildRgbInputTensor(
+                    env = runtime.env,
+                    sourceBgr = rect1,
+                    width = runtime.leftInput.width,
+                    height = runtime.leftInput.height,
+                )
+                val rightTensor = buildRgbInputTensor(
+                    env = runtime.env,
+                    sourceBgr = rect2,
+                    width = runtime.rightInput.width,
+                    height = runtime.rightInput.height,
+                )
+
+                val modelInputs = hashMapOf<String, OnnxTensor>(
+                    runtime.leftInput.name to leftTensor,
+                    runtime.rightInput.name to rightTensor,
+                )
+
+                val inferenceStartNs = System.nanoTime()
+                val disparityValues: FloatArray = try {
+                    runtime.session.run(modelInputs, setOf(runtime.output.name)).use { outputs ->
+                        readModelOutputDisparity(outputs, runtime.output)
+                    }
+                } finally {
+                    leftTensor.close()
+                    rightTensor.close()
+                }
+                val inferenceMs = ((System.nanoTime() - inferenceStartNs).toDouble() / 1_000_000.0)
+
+                val depthBytes = disparityToDepthJpeg(
+                    disparityValues = disparityValues,
+                    outputWidth = runtime.output.width,
+                    outputHeight = runtime.output.height,
+                )
+                val totalMs = ((System.nanoTime() - totalStartNs).toDouble() / 1_000_000.0)
+
+                mapOf(
+                    "success" to true,
+                    "message" to "Canlı derinlik aktif (AI ${runtime.backendLabel}).",
+                    "processedPairs" to 1,
+                    "outputPath" to calibrationFile.absolutePath,
+                    "depthBytes" to depthBytes,
+                    "imageWidth" to runtime.output.width,
+                    "imageHeight" to runtime.output.height,
+                    "backend" to runtime.backendLabel,
+                    "modelInputWidth" to runtime.leftInput.width,
+                    "modelInputHeight" to runtime.leftInput.height,
+                    "modelOutputName" to runtime.output.name,
+                    "modelOutputWidth" to runtime.output.width,
+                    "modelOutputHeight" to runtime.output.height,
+                    "stage" to "inference",
+                    "modelPath" to runtime.modelPath,
+                    "depthBytesSize" to depthBytes.size,
+                    "inferenceMs" to String.format(Locale.US, "%.2f", inferenceMs),
+                    "totalMs" to String.format(Locale.US, "%.2f", totalMs),
+                )
+            } finally {
                 src1.release()
                 src2.release()
                 rect1.release()
                 rect2.release()
-                return mapOf(
-                    "success" to false,
-                    "message" to "Model giriş tensor boyutları eşleşmiyor.",
-                    "processedPairs" to 0,
-                    "outputPath" to calibrationFile.absolutePath,
-                )
             }
-
-            val leftTensor = buildRgbInputTensor(
-                env = runtime.env,
-                sourceBgr = rect1,
-                width = runtime.leftInput.width,
-                height = runtime.leftInput.height,
-            )
-            val rightTensor = buildRgbInputTensor(
-                env = runtime.env,
-                sourceBgr = rect2,
-                width = runtime.rightInput.width,
-                height = runtime.rightInput.height,
-            )
-
-            val modelInputs = hashMapOf<String, OnnxTensor>(
-                runtime.leftInput.name to leftTensor,
-                runtime.rightInput.name to rightTensor,
-            )
-
-            val disparityValues: FloatArray = try {
-                runtime.session.run(modelInputs).use { outputs ->
-                    val outputValue = outputs[runtime.output.index]
-                    flattenNumericTensor(outputValue.value)
-                        ?: throw IllegalStateException("Model çıktısı numerik tensor olarak okunamadı.")
-                }
-            } finally {
-                leftTensor.close()
-                rightTensor.close()
-            }
-
-            val depthBytes = disparityToDepthJpeg(
-                disparityValues = disparityValues,
-                outputWidth = runtime.output.width,
-                outputHeight = runtime.output.height,
-                targetSize = rectifyMaps.imageSize,
-            )
-
-            src1.release()
-            src2.release()
-            rect1.release()
-            rect2.release()
-
-            mapOf(
-                "success" to true,
-                "message" to "Canlı derinlik aktif (AI ${runtime.backendLabel}).",
-                "processedPairs" to 1,
-                "outputPath" to calibrationFile.absolutePath,
-                "depthBytes" to depthBytes,
-                "imageWidth" to rectifyMaps.imageSize.width.toInt(),
-                "imageHeight" to rectifyMaps.imageSize.height.toInt(),
-                "backend" to runtime.backendLabel,
-                "modelInputWidth" to runtime.leftInput.width,
-                "modelInputHeight" to runtime.leftInput.height,
-                "modelOutputName" to runtime.output.name,
-                "modelOutputWidth" to runtime.output.width,
-                "modelOutputHeight" to runtime.output.height,
-            )
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.e(TAG, "Live depth map failed", e)
+            val runtime = cachedDepthModelRuntime
             mapOf(
                 "success" to false,
                 "message" to (e.message ?: "Canlı derinlik sırasında hata oluştu."),
                 "processedPairs" to 0,
                 "outputPath" to "",
+                "errorType" to e.javaClass.name,
+                "stage" to "runtime_exception",
+                "backend" to (runtime?.backendLabel ?: "unknown"),
+                "modelPath" to (runtime?.modelPath ?: ""),
+                "totalMs" to String.format(
+                    Locale.US,
+                    "%.2f",
+                    (System.nanoTime() - totalStartNs).toDouble() / 1_000_000.0,
+                ),
             )
         }
     }
@@ -902,8 +964,8 @@ class StereoPreprocessManager(private val context: Context) {
         cachedDepthModelRuntime?.let { return it }
 
         val env = OrtEnvironment.getEnvironment()
-        val modelBytes = loadDepthModelBytes()
-        val (session, backendLabel) = createDepthSession(env, modelBytes)
+        val modelPath = ensureDepthModelFilePath()
+        val (session, backendLabel) = createDepthSession(env, modelPath)
 
         val (leftInput, rightInput) = resolveModelInputSpecs(session)
         if (leftInput.width != rightInput.width || leftInput.height != rightInput.height) {
@@ -914,8 +976,11 @@ class StereoPreprocessManager(private val context: Context) {
                     "right=${rightInput.width}x${rightInput.height}",
             )
         }
+        validateDepthInputDimensions(leftInput)
+        validateDepthInputDimensions(rightInput)
 
         val output = selectDepthOutputSpec(session)
+        validateDepthOutputDimensions(output)
         val runtime = DepthModelRuntime(
             env = env,
             session = session,
@@ -923,6 +988,7 @@ class StereoPreprocessManager(private val context: Context) {
             rightInput = rightInput,
             output = output,
             backendLabel = backendLabel,
+            modelPath = modelPath,
         )
         cachedDepthModelRuntime = runtime
 
@@ -938,30 +1004,14 @@ class StereoPreprocessManager(private val context: Context) {
 
     private fun createDepthSession(
         env: OrtEnvironment,
-        modelBytes: ByteArray,
+        modelPath: String,
     ): Pair<OrtSession, String> {
-        try {
-            val nnapiOptions = OrtSession.SessionOptions()
-            try {
-                nnapiOptions.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-                nnapiOptions.setIntraOpNumThreads(2)
-                nnapiOptions.setInterOpNumThreads(1)
-                nnapiOptions.addNnapi()
-                val session = env.createSession(modelBytes, nnapiOptions)
-                return session to "NNAPI"
-            } finally {
-                nnapiOptions.close()
-            }
-        } catch (nnapiError: Exception) {
-            Log.w(TAG, "NNAPI backend açılamadı, CPU fallback kullanılacak.", nnapiError)
-        }
-
         val cpuOptions = OrtSession.SessionOptions()
         try {
             cpuOptions.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
             cpuOptions.setIntraOpNumThreads(4)
             cpuOptions.setInterOpNumThreads(1)
-            val cpuSession = env.createSession(modelBytes, cpuOptions)
+            val cpuSession = env.createSession(modelPath, cpuOptions)
             return cpuSession to "CPU"
         } finally {
             cpuOptions.close()
@@ -1038,8 +1088,39 @@ class StereoPreprocessManager(private val context: Context) {
             return preferred
         }
 
-        return candidates.firstOrNull()
+        val semanticCandidates = candidates.filter {
+            val lowered = it.name.lowercase(Locale.ROOT)
+            lowered.contains("dispar") || lowered.contains("depth")
+        }
+        if (semanticCandidates.isNotEmpty()) {
+            return semanticCandidates.minByOrNull { pixelCount(it.width, it.height) }
+                ?: semanticCandidates.first()
+        }
+
+        return candidates.minByOrNull { pixelCount(it.width, it.height) }
             ?: throw IllegalStateException("Modelde uygun float çıkış tensoru bulunamadı.")
+    }
+
+    private fun pixelCount(width: Int, height: Int): Long = width.toLong() * height.toLong()
+
+    private fun validateDepthInputDimensions(input: DepthInputTensorSpec) {
+        val pixels = pixelCount(input.width, input.height)
+        if (pixels <= 0L || pixels > MAX_DEPTH_INPUT_PIXELS.toLong()) {
+            throw IllegalStateException(
+                "Model giriş boyutu çok büyük: ${input.name}=${input.width}x${input.height} " +
+                    "($pixels px). Maksimum: $MAX_DEPTH_INPUT_PIXELS px.",
+            )
+        }
+    }
+
+    private fun validateDepthOutputDimensions(output: DepthOutputTensorSpec) {
+        val pixels = pixelCount(output.width, output.height)
+        if (pixels <= 0L || pixels > MAX_DEPTH_OUTPUT_PIXELS.toLong()) {
+            throw IllegalStateException(
+                "Model çıkış boyutu çok büyük: ${output.name}=${output.width}x${output.height} " +
+                    "($pixels px). Maksimum: $MAX_DEPTH_OUTPUT_PIXELS px.",
+            )
+        }
     }
 
     private fun toPositiveIntDimension(value: Long): Int? {
@@ -1101,36 +1182,48 @@ class StereoPreprocessManager(private val context: Context) {
         return nchw
     }
 
-    private fun flattenNumericTensor(raw: Any?): FloatArray? {
-        if (raw == null) return null
+    private fun readModelOutputDisparity(
+        outputs: OrtSession.Result,
+        outputSpec: DepthOutputTensorSpec,
+    ): FloatArray {
+        val byName = outputs.get(outputSpec.name).orElse(null)
+        val selected = byName ?: try {
+            outputs.get(outputSpec.index)
+        } catch (_: Exception) {
+            null
+        } ?: throw IllegalStateException(
+            "Model çıktısı bulunamadı: ${outputSpec.name} (index=${outputSpec.index})",
+        )
 
-        val output = ArrayList<Float>()
+        val tensor = selected as? OnnxTensor
+            ?: throw IllegalStateException("Model çıktısı tensor değil: ${selected.javaClass.name}")
 
-        fun visit(value: Any?) {
-            when (value) {
-                null -> Unit
-                is Float -> output.add(value)
-                is Double -> output.add(value.toFloat())
-                is Number -> output.add(value.toFloat())
-                is FloatArray -> value.forEach { output.add(it) }
-                is DoubleArray -> value.forEach { output.add(it.toFloat()) }
-                is IntArray -> value.forEach { output.add(it.toFloat()) }
-                is LongArray -> value.forEach { output.add(it.toFloat()) }
-                is Array<*> -> value.forEach { visit(it) }
-                else -> Unit
-            }
+        val expected = outputSpec.width * outputSpec.height
+        val floatBuffer = tensor.floatBuffer
+        floatBuffer.rewind()
+        val available = floatBuffer.remaining()
+        if (available < expected) {
+            throw IllegalStateException(
+                "Model çıktısı beklenenden küçük: $available < $expected (${outputSpec.name})",
+            )
         }
 
-        visit(raw)
-        if (output.isEmpty()) return null
-        return output.toFloatArray()
+        if (available > expected) {
+            Log.w(
+                TAG,
+                "Model çıktısı $available eleman içeriyor; sadece ilk $expected eleman kullanılacak (${outputSpec.name}).",
+            )
+        }
+
+        val disparity = FloatArray(expected)
+        floatBuffer.get(disparity, 0, expected)
+        return disparity
     }
 
     private fun disparityToDepthJpeg(
         disparityValues: FloatArray,
         outputWidth: Int,
         outputHeight: Int,
-        targetSize: Size,
     ): ByteArray {
         val expected = outputWidth * outputHeight
         if (disparityValues.size < expected) {
@@ -1139,44 +1232,25 @@ class StereoPreprocessManager(private val context: Context) {
             )
         }
 
-        var minVal = Float.POSITIVE_INFINITY
-        var maxVal = Float.NEGATIVE_INFINITY
+        val rawBytes = ByteArray(expected)
         for (index in 0 until expected) {
             val value = disparityValues[index]
-            if (!value.isFinite()) continue
-            if (value < minVal) minVal = value
-            if (value > maxVal) maxVal = value
-        }
-
-        if (!minVal.isFinite() || !maxVal.isFinite()) {
-            throw IllegalStateException("Model çıktısı geçerli disparity değeri içermiyor.")
-        }
-
-        val normalized = ByteArray(expected)
-        val range = (maxVal - minVal).coerceAtLeast(1e-6f)
-        for (index in 0 until expected) {
-            val value = disparityValues[index]
-            val scaled = if (!value.isFinite()) {
+            val raw = if (!value.isFinite()) {
                 0
             } else {
-                (((value - minVal) / range) * 255f).toInt().coerceIn(0, 255)
+                value.toInt().coerceIn(0, 255)
             }
-            normalized[index] = scaled.toByte()
+            rawBytes[index] = raw.toByte()
         }
 
         val disparity8 = Mat(outputHeight, outputWidth, CvType.CV_8U)
-        val depthColor = Mat()
         val outDepth = MatOfByte()
         val encodeParams = MatOfInt(Imgcodecs.IMWRITE_JPEG_QUALITY, DEPTH_JPEG_QUALITY)
 
         try {
-            disparity8.put(0, 0, normalized)
-            Imgproc.applyColorMap(disparity8, depthColor, Imgproc.COLORMAP_TURBO)
-            if (depthColor.size() != targetSize) {
-                Imgproc.resize(depthColor, depthColor, targetSize, 0.0, 0.0, Imgproc.INTER_LINEAR)
-            }
+            disparity8.put(0, 0, rawBytes)
 
-            val encoded = Imgcodecs.imencode(".jpg", depthColor, outDepth, encodeParams)
+            val encoded = Imgcodecs.imencode(".jpg", disparity8, outDepth, encodeParams)
             if (!encoded) {
                 throw IllegalStateException("Derinlik JPEG encode başarısız.")
             }
@@ -1188,13 +1262,35 @@ class StereoPreprocessManager(private val context: Context) {
             return depthBytes
         } finally {
             disparity8.release()
-            depthColor.release()
             outDepth.release()
             encodeParams.release()
         }
     }
 
-    private fun loadDepthModelBytes(): ByteArray {
+    private fun ensureDepthModelFilePath(): String {
+        val cacheDir = File(context.noBackupFilesDir, DEPTH_MODEL_CACHE_DIR)
+        if (!cacheDir.exists()) {
+            cacheDir.mkdirs()
+        }
+
+        val cachedModelFile = File(cacheDir, DEPTH_MODEL_DIRECT_ASSET)
+        val versionFile = File(cacheDir, DEPTH_MODEL_CACHE_VERSION_FILE)
+        val hasCurrentVersion =
+            versionFile.exists() &&
+                runCatching { versionFile.readText().trim() == DEPTH_MODEL_CACHE_VERSION.toString() }
+                    .getOrDefault(false)
+
+        if (cachedModelFile.exists() && cachedModelFile.length() > 0L && hasCurrentVersion) {
+            return cachedModelFile.absolutePath
+        }
+
+        if (cachedModelFile.exists()) {
+            cachedModelFile.delete()
+        }
+        if (versionFile.exists()) {
+            versionFile.delete()
+        }
+
         val candidates = listOf(
             DEPTH_MODEL_ASSET_PATH,
             DEPTH_MODEL_ASSET_FALLBACK,
@@ -1204,16 +1300,35 @@ class StereoPreprocessManager(private val context: Context) {
         for (candidate in candidates) {
             try {
                 context.assets.open(candidate).use { input ->
-                    return input.readBytes()
+                    cachedModelFile.outputStream().buffered(MODEL_COPY_BUFFER_BYTES).use { output ->
+                        input.copyTo(output, MODEL_COPY_BUFFER_BYTES)
+                        output.flush()
+                    }
+
+                    if (cachedModelFile.length() > 0L) {
+                        versionFile.writeText(DEPTH_MODEL_CACHE_VERSION.toString())
+                        Log.i(
+                            TAG,
+                            "Depth model dosyaya kopyalandı: ${cachedModelFile.absolutePath} " +
+                                "(${cachedModelFile.length()} bytes)",
+                        )
+                        return cachedModelFile.absolutePath
+                    }
                 }
             } catch (_: Exception) {
+                if (cachedModelFile.exists() && cachedModelFile.length() == 0L) {
+                    cachedModelFile.delete()
+                }
+                if (versionFile.exists()) {
+                    versionFile.delete()
+                }
                 // try next candidate
             }
         }
 
         throw IllegalStateException(
             "Derinlik modeli asset bulunamadı. pubspec.yaml içinde " +
-                "assets/foundation_stereo_cleaned_fp32.onnx tanımlı olmalı.",
+                "assets/foundation_stereo_int8.onnx tanımlı olmalı.",
         )
     }
 

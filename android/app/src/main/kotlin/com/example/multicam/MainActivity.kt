@@ -14,6 +14,7 @@ import android.hardware.SensorManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Debug
+import android.util.Log
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -58,6 +59,10 @@ class MainActivity : FlutterActivity() {
 private class DualCameraHandler(
 	context: Context,
 ) : MethodChannel.MethodCallHandler {
+	private companion object {
+		private const val TAG = "DualCameraHandler"
+	}
+
 	private val dualCameraManager = DualCameraManager(context)
 	private val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
 	private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -67,8 +72,13 @@ private class DualCameraHandler(
 			try {
 				val value = block()
 				mainHandler.post { result.success(value) }
-			} catch (e: Exception) {
-				mainHandler.post { result.error("CAMERA_ERROR", e.message, null) }
+			} catch (throwable: Throwable) {
+				Log.e(TAG, "Dual camera background task failed", throwable)
+				val errorType = throwable.javaClass.name
+				val errorMessage = throwable.message ?: "Bilinmeyen hata"
+				mainHandler.post {
+					result.error("CAMERA_ERROR", "$errorType: $errorMessage", null)
+				}
 			}
 		}
 	}
@@ -132,6 +142,10 @@ private class DualCameraHandler(
 private class StereoPreprocessHandler(
 	context: Context,
 ) : MethodChannel.MethodCallHandler {
+	private companion object {
+		private const val TAG = "StereoPreprocessHandler"
+	}
+
 	private val manager = StereoPreprocessManager(context)
 	private val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
 	private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -141,8 +155,20 @@ private class StereoPreprocessHandler(
 			try {
 				val value = block()
 				mainHandler.post { result.success(value) }
-			} catch (e: Exception) {
-				mainHandler.post { result.error("STEREO_PREPROCESS_ERROR", e.message, null) }
+			} catch (throwable: Throwable) {
+				Log.e(TAG, "Stereo preprocess background task failed", throwable)
+				val errorType = throwable.javaClass.name
+				val errorMessage = throwable.message ?: "Bilinmeyen hata"
+				mainHandler.post {
+					result.error(
+						"STEREO_PREPROCESS_ERROR",
+						"$errorType: $errorMessage",
+						mapOf(
+							"type" to errorType,
+							"stacktrace" to Log.getStackTraceString(throwable),
+						),
+					)
+				}
 			}
 		}
 	}
@@ -210,6 +236,13 @@ private class StereoPreprocessHandler(
 				}
 				runOnBackground(result) {
 					manager.depthFramePair(cam1Bytes, cam2Bytes)
+				}
+			}
+
+			"releaseDepthModel" -> {
+				val reason = call.argument<String>("reason") ?: "manual"
+				runOnBackground(result) {
+					manager.releaseDepthModelRuntime(reason)
 				}
 			}
 

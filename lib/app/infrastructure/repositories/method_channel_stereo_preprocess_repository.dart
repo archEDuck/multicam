@@ -88,6 +88,25 @@ class MethodChannelStereoPreprocessRepository
   }
 
   @override
+  Future<StereoPreprocessResult> releaseDepthModel({
+    String reason = 'manual',
+  }) async {
+    try {
+      final dynamic raw = await _channel.invokeMethod('releaseDepthModel', {
+        'reason': reason,
+      });
+      if (raw is Map) {
+        return StereoPreprocessResult.fromMap(raw);
+      }
+      return StereoPreprocessResult.empty(
+        'Model kapatma sonucu okunamadı (boş yanıt).',
+      );
+    } catch (e) {
+      return StereoPreprocessResult.empty('Model kapatma hatası: $e');
+    }
+  }
+
+  @override
   Future<StereoPreprocessResult> getCalibrationStatus() async {
     try {
       final dynamic raw = await _channel.invokeMethod('getCalibrationStatus');

@@ -54,7 +54,7 @@ android {
 
 dependencies {
     implementation("org.opencv:opencv:4.13.0")
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.24.3")
 }
 
 flutter {

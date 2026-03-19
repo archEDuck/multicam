@@ -409,7 +409,12 @@ class DepthMapPhasePanel extends StatelessWidget {
         ),
         const SizedBox(height: 6),
         const Text(
-          'Isınmayı azaltmak için derinlik hesabı düşük çözünürlükte ve aralıklı çalışır.',
+          'Canlı derinlik her uygun preview karesinde çalışır.',
+          style: TextStyle(color: Colors.white54, fontSize: 12),
+        ),
+        const SizedBox(height: 4),
+        const Text(
+          'Giriş modelin beklediği boyutta verilir, çıkış model çözünürlüğünde alınır.',
           style: TextStyle(color: Colors.white54, fontSize: 12),
         ),
         const SizedBox(height: 8),
@@ -465,7 +470,7 @@ class _CameraSelectorField extends StatelessWidget {
               : null);
 
     return DropdownButtonFormField<String>(
-      value: effectiveValue,
+      initialValue: effectiveValue,
       decoration: InputDecoration(
         labelText: label,
         border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
@@ -504,7 +509,7 @@ class _SelectedCameraInfo extends StatelessWidget {
       width: double.infinity,
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
-        color: theme.colorScheme.surfaceContainerHighest.withOpacity(0.35),
+        color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.35),
         borderRadius: BorderRadius.circular(12),
       ),
       child: Column(

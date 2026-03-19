@@ -64,7 +64,7 @@ flutter:
   uses-material-design: true
 
   assets:
-    - assets/foundation_stereo_cleaned_fp32.onnx
+    - assets/foundation_stereo_int8.onnx
 
   # To add assets to your application, add an assets section, like this:
   # assets:
