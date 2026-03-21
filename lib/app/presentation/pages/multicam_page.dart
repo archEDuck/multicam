@@ -1,5 +1,8 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -68,6 +71,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
   Timer? _statsTimer;
   Timer? _previewTimer;
   Timer? _checkerboardTimer;
+  Timer? _phase4UploadTimer;
 
   bool _isReady = false;
   bool _isRecording = false;
@@ -79,6 +83,9 @@ class _MultiCamPageState extends State<MultiCamPage> {
   bool _isGuidedCalibrationPairCapturing = false;
   bool _isCalibrationCaptureRunning = false;
   bool _isLiveRectifyProcessing = false;
+  bool _isPhase4Streaming = false;
+  bool _isPhase4UploadBusy = false;
+  bool _isPhase4AutoDetectingServer = false;
 
   String _status = 'Başlatılıyor...';
   String _camera2Status = 'Camera2 raporu hazırlanıyor...';
@@ -90,6 +97,12 @@ class _MultiCamPageState extends State<MultiCamPage> {
   int _requiredCalibrationPairs = _defaultRequiredCalibrationPairs;
   DateTime? _lastCalibrationCaptureAt;
   DateTime? _lastLiveRectifyAt;
+  String _phase4ServerUrl = 'http://192.168.1.50:8000';
+  int _phase4IntervalSeconds = 2;
+  int _phase4TargetPairCount = 100;
+  int _phase4UploadedPairCount = 0;
+  String? _phase4SessionId;
+  Directory? _phase4SessionDir;
 
   double? _fotCm;
   int _frameIndex = 0;
@@ -179,6 +192,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
     _stopStatsPolling();
     _stopPreviewLoop();
     _stopCheckerboardLoop();
+    _stopPhase4UploadLoop();
     _stopFotStream();
     _stopImuStreams();
 
@@ -1089,6 +1103,11 @@ class _MultiCamPageState extends State<MultiCamPage> {
       await _stopRecordingSession();
     }
 
+    if (_phase == CaptureWorkflowPhase.rawStreamingUpload &&
+        nextPhase != CaptureWorkflowPhase.rawStreamingUpload) {
+      _stopPhase4UploadLoop(statusMessage: 'Faz 4 akışı durduruldu.');
+    }
+
     if (!mounted) return;
     setState(() {
       _phase = nextPhase;
@@ -1113,6 +1132,11 @@ class _MultiCamPageState extends State<MultiCamPage> {
         _cam2CheckerboardCorners = const [];
         _checkerboardFoundCam1 = false;
         _checkerboardFoundCam2 = false;
+      }
+
+      if (nextPhase != CaptureWorkflowPhase.rawStreamingUpload) {
+        _isPhase4Streaming = false;
+        _isPhase4UploadBusy = false;
       }
     });
 
@@ -1376,6 +1400,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
         calibrationExists ? 'rectify_' : 'calib_',
       CaptureWorkflowPhase.calibration => 'calib_',
       CaptureWorkflowPhase.stereoMatching => 'rectify_',
+      CaptureWorkflowPhase.rawStreamingUpload => 'upload_',
     };
 
     final timestamp = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
@@ -1392,6 +1417,357 @@ class _MultiCamPageState extends State<MultiCamPage> {
     ).create(recursive: true);
 
     return sessionDir;
+  }
+
+  Future<Directory> _createPhase4SessionFolder(String sessionId) async {
+    Directory baseDir;
+
+    if (Platform.isAndroid) {
+      baseDir =
+          (await getExternalStorageDirectory()) ??
+          (await getApplicationDocumentsDirectory());
+    } else {
+      baseDir = await getApplicationDocumentsDirectory();
+    }
+
+    final sessionDir = Directory(
+      '${baseDir.path}${Platform.pathSeparator}stereo_sessions${Platform.pathSeparator}$sessionId',
+    );
+
+    await Directory(
+      '${sessionDir.path}${Platform.pathSeparator}cam1',
+    ).create(recursive: true);
+    await Directory(
+      '${sessionDir.path}${Platform.pathSeparator}cam2',
+    ).create(recursive: true);
+
+    return sessionDir;
+  }
+
+  String _normalizeServerBaseUrl(String raw) {
+    final trimmed = raw.trim();
+    if (trimmed.endsWith('/')) {
+      return trimmed.substring(0, trimmed.length - 1);
+    }
+    return trimmed;
+  }
+
+  Future<bool> _checkPhase4ServerHealth(String baseUrl) async {
+    final normalized = _normalizeServerBaseUrl(baseUrl);
+    final uri = Uri.tryParse('$normalized/health');
+    if (uri == null || uri.host.isEmpty) {
+      return false;
+    }
+
+    final client = HttpClient();
+    try {
+      final request = await client
+          .getUrl(uri)
+          .timeout(const Duration(milliseconds: 700));
+      final response = await request.close().timeout(
+        const Duration(milliseconds: 700),
+      );
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        return false;
+      }
+      final body = await utf8.decodeStream(response);
+      return body.toLowerCase().contains('ok');
+    } catch (_) {
+      return false;
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<String?> _autoDetectPhase4ServerUrl() async {
+    if (_isPhase4AutoDetectingServer) {
+      return null;
+    }
+
+    _isPhase4AutoDetectingServer = true;
+    try {
+      final current = _normalizeServerBaseUrl(_phase4ServerUrl);
+      if (await _checkPhase4ServerHealth(current)) {
+        return current;
+      }
+
+      final interfaces = await NetworkInterface.list(
+        includeLoopback: false,
+        type: InternetAddressType.IPv4,
+      );
+
+      final localCandidates = <String>{};
+      for (final interface in interfaces) {
+        for (final addr in interface.addresses) {
+          final ip = addr.address;
+          if (ip.startsWith('192.168.') ||
+              ip.startsWith('10.') ||
+              ip.startsWith('172.16.') ||
+              ip.startsWith('172.17.') ||
+              ip.startsWith('172.18.') ||
+              ip.startsWith('172.19.') ||
+              ip.startsWith('172.2') ||
+              ip.startsWith('172.30.') ||
+              ip.startsWith('172.31.')) {
+            localCandidates.add(ip);
+          }
+        }
+      }
+
+      for (final localIp in localCandidates) {
+        final parts = localIp.split('.');
+        if (parts.length != 4) continue;
+        final prefix = '${parts[0]}.${parts[1]}.${parts[2]}';
+
+        const maxParallel = 24;
+        final futures = <Future<String?>>[];
+        for (var host = 2; host <= 254; host++) {
+          if ('$prefix.$host' == localIp) continue;
+          futures.add(() async {
+            final candidate = 'http://$prefix.$host:8000';
+            final ok = await _checkPhase4ServerHealth(candidate);
+            return ok ? candidate : null;
+          }());
+
+          if (futures.length >= maxParallel) {
+            final results = await Future.wait(futures);
+            for (final value in results) {
+              if (value != null) {
+                return value;
+              }
+            }
+            futures.clear();
+          }
+        }
+
+        if (futures.isNotEmpty) {
+          final results = await Future.wait(futures);
+          for (final value in results) {
+            if (value != null) {
+              return value;
+            }
+          }
+        }
+      }
+
+      return null;
+    } finally {
+      _isPhase4AutoDetectingServer = false;
+    }
+  }
+
+  Future<bool> _uploadSingleFrameMultipart({
+    required Uri endpoint,
+    required String sessionId,
+    required String cameraLabel,
+    required int frameIndex,
+    required String timestamp,
+    required File file,
+  }) async {
+    final bytes = await file.readAsBytes();
+    final boundary =
+        '----multicamBoundary${DateTime.now().microsecondsSinceEpoch}${Random().nextInt(1 << 32)}';
+    final body = BytesBuilder();
+
+    void addField(String name, String value) {
+      body.add(utf8.encode('--$boundary\r\n'));
+      body.add(
+        utf8.encode(
+          'Content-Disposition: form-data; name="$name"\r\n\r\n$value\r\n',
+        ),
+      );
+    }
+
+    addField('session_id', sessionId);
+    addField('camera_label', cameraLabel);
+    addField('frame_index', '$frameIndex');
+    addField('timestamp', timestamp);
+
+    body.add(utf8.encode('--$boundary\r\n'));
+    body.add(
+      utf8.encode(
+        'Content-Disposition: form-data; name="file"; filename="${file.uri.pathSegments.last}"\r\n',
+      ),
+    );
+    body.add(utf8.encode('Content-Type: image/jpeg\r\n\r\n'));
+    body.add(bytes);
+    body.add(utf8.encode('\r\n--$boundary--\r\n'));
+
+    final client = HttpClient();
+    try {
+      final request = await client.postUrl(endpoint);
+      request.headers.set(
+        HttpHeaders.contentTypeHeader,
+        'multipart/form-data; boundary=$boundary',
+      );
+      request.add(body.takeBytes());
+
+      final response = await request.close();
+      final responseText = await utf8.decodeStream(response);
+      final ok = response.statusCode >= 200 && response.statusCode < 300;
+      if (!ok) {
+        throw HttpException(
+          'Upload başarısız (${response.statusCode}): $responseText',
+        );
+      }
+      return true;
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<void> _phase4CaptureAndUploadTick() async {
+    if (!_isPhase4Streaming || _isPhase4UploadBusy || !_isReady) {
+      return;
+    }
+
+    final sessionId = _phase4SessionId;
+    final sessionDir = _phase4SessionDir;
+    if (sessionId == null || sessionDir == null) {
+      return;
+    }
+
+    _isPhase4UploadBusy = true;
+    try {
+      final frameIndex = _phase4UploadedPairCount;
+      final now = DateTime.now().toUtc();
+      final ts = DateFormat('yyyyMMdd_HHmmss_SSS').format(now);
+
+      final cam1Path =
+          '${sessionDir.path}${Platform.pathSeparator}cam1${Platform.pathSeparator}frame_${frameIndex}_$ts.jpg';
+      final cam2Path =
+          '${sessionDir.path}${Platform.pathSeparator}cam2${Platform.pathSeparator}frame_${frameIndex}_$ts.jpg';
+
+      final capture = await Camera2Bridge.captureDualFrame(cam1Path, cam2Path);
+      final cam1Saved = capture['cam1Saved'] == true;
+      final cam2Saved = capture['cam2Saved'] == true;
+
+      if (!cam1Saved || !cam2Saved) {
+        if (!mounted) return;
+        setState(() {
+          _status =
+              'Faz 4 capture başarısız (cam1=$cam1Saved, cam2=$cam2Saved). Sonraki denemede tekrar edilecek.';
+        });
+        return;
+      }
+
+      final baseUrl = _normalizeServerBaseUrl(_phase4ServerUrl);
+      final endpoint = Uri.parse('$baseUrl/upload-file');
+
+      await _uploadSingleFrameMultipart(
+        endpoint: endpoint,
+        sessionId: sessionId,
+        cameraLabel: 'cam1',
+        frameIndex: frameIndex,
+        timestamp: now.toIso8601String(),
+        file: File(cam1Path),
+      );
+
+      await _uploadSingleFrameMultipart(
+        endpoint: endpoint,
+        sessionId: sessionId,
+        cameraLabel: 'cam2',
+        frameIndex: frameIndex,
+        timestamp: now.toIso8601String(),
+        file: File(cam2Path),
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _phase4UploadedPairCount += 1;
+        _status =
+            'Faz 4 upload: $_phase4UploadedPairCount/$_phase4TargetPairCount çift tamamlandı.';
+      });
+
+      if (_phase4UploadedPairCount >= _phase4TargetPairCount) {
+        _stopPhase4UploadLoop(
+          statusMessage:
+              'Faz 4 tamamlandı. Toplam $_phase4UploadedPairCount çift upload edildi.',
+        );
+      }
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _status = 'Faz 4 upload hatası: $error';
+      });
+    } finally {
+      _isPhase4UploadBusy = false;
+    }
+  }
+
+  Future<void> _startPhase4UploadLoop() async {
+    if (_isPhase4Streaming || _isPhase4UploadBusy) {
+      return;
+    }
+
+    var baseUrl = _normalizeServerBaseUrl(_phase4ServerUrl);
+    final detected = await _autoDetectPhase4ServerUrl();
+    if (detected != null && detected != baseUrl) {
+      baseUrl = detected;
+      if (mounted) {
+        setState(() {
+          _phase4ServerUrl = detected;
+          _status = 'Faz 4 sunucu otomatik bulundu: $detected';
+        });
+      }
+    }
+
+    final parsed = Uri.tryParse(baseUrl);
+    final hasValidUrl =
+        parsed != null &&
+        (parsed.scheme == 'http' || parsed.scheme == 'https') &&
+        parsed.host.isNotEmpty;
+    if (!hasValidUrl) {
+      if (!mounted) return;
+      setState(() {
+        _status =
+            'Faz 4 sunucusu otomatik bulunamadı. URL girin (örn: http://192.168.1.50:8000).';
+      });
+      return;
+    }
+
+    final sessionId =
+        'session_${DateFormat('yyyyMMdd_HHmmss').format(DateTime.now())}';
+    final sessionDir = await _createPhase4SessionFolder(sessionId);
+
+    if (!mounted) return;
+    setState(() {
+      _phase4SessionId = sessionId;
+      _phase4SessionDir = sessionDir;
+      _phase4UploadedPairCount = 0;
+      _isPhase4Streaming = true;
+      _status = 'Faz 4 başladı. Session: $sessionId';
+    });
+
+    await _phase4CaptureAndUploadTick();
+
+    _phase4UploadTimer?.cancel();
+    _phase4UploadTimer = Timer.periodic(
+      Duration(seconds: _phase4IntervalSeconds),
+      (_) => unawaited(_phase4CaptureAndUploadTick()),
+    );
+  }
+
+  void _stopPhase4UploadLoop({String? statusMessage}) {
+    _phase4UploadTimer?.cancel();
+    _phase4UploadTimer = null;
+
+    if (!mounted) return;
+    setState(() {
+      _isPhase4Streaming = false;
+      _isPhase4UploadBusy = false;
+      if ((statusMessage ?? '').isNotEmpty) {
+        _status = statusMessage!;
+      }
+    });
+  }
+
+  void _togglePhase4UploadLoop() {
+    if (_isPhase4Streaming) {
+      _stopPhase4UploadLoop(statusMessage: 'Faz 4 akışı kullanıcı tarafından durduruldu.');
+      return;
+    }
+    unawaited(_startPhase4UploadLoop());
   }
 
   Future<void> _captureFramePair({
@@ -1747,8 +2123,42 @@ class _MultiCamPageState extends State<MultiCamPage> {
           sessionName: stereoSessionName,
           rectifiedOutputPath: _lastRectifiedOutputPath,
           onToggleLiveRectify: _runRectifyOnDevice,
+          onGoPhaseFour: () {
+            unawaited(
+              _transitionToPhase(CaptureWorkflowPhase.rawStreamingUpload),
+            );
+          },
           onBackToPhaseOne: () {
             unawaited(_transitionToPhase(CaptureWorkflowPhase.cameraSelection));
+          },
+        );
+      case CaptureWorkflowPhase.rawStreamingUpload:
+        return RawStreamingUploadPhasePanel(
+          isStreaming: _isPhase4Streaming,
+          isBusy: _isPhase4UploadBusy,
+          serverUrl: _phase4ServerUrl,
+          intervalSeconds: _phase4IntervalSeconds,
+          targetPairCount: _phase4TargetPairCount,
+          uploadedPairCount: _phase4UploadedPairCount,
+          activeSessionId: _phase4SessionId,
+          onServerUrlChanged: (value) {
+            _phase4ServerUrl = value;
+          },
+          onIntervalChanged: (value) {
+            setState(() {
+              _phase4IntervalSeconds = value;
+            });
+          },
+          onTargetPairCountChanged: (value) {
+            final parsed = int.tryParse(value.trim());
+            if (parsed == null || parsed <= 0) return;
+            setState(() {
+              _phase4TargetPairCount = parsed;
+            });
+          },
+          onToggleStreaming: _togglePhase4UploadLoop,
+          onGoPhaseThree: () {
+            unawaited(_transitionToPhase(CaptureWorkflowPhase.stereoMatching));
           },
         );
     }

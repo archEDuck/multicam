@@ -325,6 +325,7 @@ class StereoMatchingPhasePanel extends StatelessWidget {
     required this.sessionName,
     required this.rectifiedOutputPath,
     required this.onToggleLiveRectify,
+    required this.onGoPhaseFour,
     required this.onBackToPhaseOne,
   });
 
@@ -333,6 +334,7 @@ class StereoMatchingPhasePanel extends StatelessWidget {
   final String sessionName;
   final String? rectifiedOutputPath;
   final VoidCallback onToggleLiveRectify;
+  final VoidCallback onGoPhaseFour;
   final VoidCallback onBackToPhaseOne;
 
   @override
@@ -374,8 +376,143 @@ class StereoMatchingPhasePanel extends StatelessWidget {
             ),
             const SizedBox(width: 8),
             OutlinedButton(
+              onPressed: isStereoProcessing ? null : onGoPhaseFour,
+              child: const Text('Faz 4'),
+            ),
+            const SizedBox(width: 8),
+            OutlinedButton(
               onPressed: isStereoProcessing ? null : onBackToPhaseOne,
               child: const Text('Faz 1'),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+}
+
+class RawStreamingUploadPhasePanel extends StatelessWidget {
+  const RawStreamingUploadPhasePanel({
+    super.key,
+    required this.isStreaming,
+    required this.isBusy,
+    required this.serverUrl,
+    required this.intervalSeconds,
+    required this.targetPairCount,
+    required this.uploadedPairCount,
+    required this.activeSessionId,
+    required this.onServerUrlChanged,
+    required this.onIntervalChanged,
+    required this.onTargetPairCountChanged,
+    required this.onToggleStreaming,
+    required this.onGoPhaseThree,
+  });
+
+  final bool isStreaming;
+  final bool isBusy;
+  final String serverUrl;
+  final int intervalSeconds;
+  final int targetPairCount;
+  final int uploadedPairCount;
+  final String? activeSessionId;
+  final ValueChanged<String> onServerUrlChanged;
+  final ValueChanged<int> onIntervalChanged;
+  final ValueChanged<String> onTargetPairCountChanged;
+  final VoidCallback onToggleStreaming;
+  final VoidCallback onGoPhaseThree;
+
+  @override
+  Widget build(BuildContext context) {
+    final remaining = (targetPairCount - uploadedPairCount).clamp(
+      0,
+      targetPairCount,
+    );
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'Faz 3 çalışırken ham frame çiftleri belirli aralıkla alınıp yerel sunucuya gönderilir.',
+          style: TextStyle(color: Colors.white70),
+        ),
+        const SizedBox(height: 8),
+        TextFormField(
+          enabled: !isStreaming,
+          initialValue: serverUrl,
+          onChanged: onServerUrlChanged,
+          decoration: const InputDecoration(
+            labelText: 'Sunucu URL (örn: http://192.168.1.50:8000)',
+            border: OutlineInputBorder(),
+            isDense: true,
+          ),
+        ),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            const Text('Aralık:', style: TextStyle(color: Colors.white70)),
+            const SizedBox(width: 8),
+            DropdownButton<int>(
+              value: intervalSeconds,
+              dropdownColor: Colors.grey.shade800,
+              style: const TextStyle(color: Colors.white),
+              onChanged: isStreaming || isBusy
+                  ? null
+                  : (value) {
+                      if (value != null) onIntervalChanged(value);
+                    },
+              items: const [2, 4, 6, 8]
+                  .map(
+                    (value) => DropdownMenuItem(
+                      value: value,
+                      child: Text('$value sn'),
+                    ),
+                  )
+                  .toList(),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: TextFormField(
+                enabled: !isStreaming,
+                initialValue: '$targetPairCount',
+                keyboardType: TextInputType.number,
+                onChanged: onTargetPairCountChanged,
+                decoration: const InputDecoration(
+                  labelText: 'Hedef çift sayısı',
+                  border: OutlineInputBorder(),
+                  isDense: true,
+                ),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Text(
+          'Yüklenen: $uploadedPairCount / $targetPairCount | Kalan: $remaining',
+          style: const TextStyle(color: Colors.lightBlueAccent),
+        ),
+        if ((activeSessionId ?? '').isNotEmpty)
+          Text(
+            'Aktif session: $activeSessionId',
+            style: const TextStyle(color: Colors.lightGreenAccent),
+          ),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            Expanded(
+              child: FilledButton.icon(
+                onPressed: isBusy ? null : onToggleStreaming,
+                icon: Icon(
+                  isStreaming
+                      ? Icons.stop_circle_outlined
+                      : Icons.cloud_upload_outlined,
+                ),
+                label: Text(isStreaming ? 'Akışı Durdur' : 'Akışı Başlat'),
+              ),
+            ),
+            const SizedBox(width: 8),
+            OutlinedButton(
+              onPressed: isStreaming ? null : onGoPhaseThree,
+              child: const Text('Faz 3'),
             ),
           ],
         ),

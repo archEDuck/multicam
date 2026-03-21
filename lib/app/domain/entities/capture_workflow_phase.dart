@@ -2,6 +2,7 @@ enum CaptureWorkflowPhase {
   cameraSelection,
   calibration,
   stereoMatching,
+  rawStreamingUpload,
 }
 
 extension CaptureWorkflowPhaseLabel on CaptureWorkflowPhase {
@@ -13,6 +14,8 @@ extension CaptureWorkflowPhaseLabel on CaptureWorkflowPhase {
         return 'Faz 2';
       case CaptureWorkflowPhase.stereoMatching:
         return 'Faz 3';
+      case CaptureWorkflowPhase.rawStreamingUpload:
+        return 'Faz 4';
     }
   }
 
@@ -24,6 +27,8 @@ extension CaptureWorkflowPhaseLabel on CaptureWorkflowPhase {
         return 'Kalibrasyon';
       case CaptureWorkflowPhase.stereoMatching:
         return 'Stereo Eşleme';
+      case CaptureWorkflowPhase.rawStreamingUpload:
+        return 'Ham Kayıt + Upload';
     }
   }
 }

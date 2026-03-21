@@ -54,11 +54,28 @@ class WorkflowPhaseTransitionController {
       );
     }
 
+    if (nextPhase == CaptureWorkflowPhase.rawStreamingUpload && !isReady) {
+      return const PhaseTransitionPlan(
+        allowed: false,
+        blockMessage:
+            'Kameralar hazır değil. Önce Faz 1’de kamera çiftini açın.',
+      );
+    }
+
     if (nextPhase == CaptureWorkflowPhase.stereoMatching &&
         !hasCachedCalibration) {
       return const PhaseTransitionPlan(
         allowed: false,
         blockMessage: 'Bu faz için önce Faz 2 kalibrasyonunu tamamlamalısınız.',
+      );
+    }
+
+    if (nextPhase == CaptureWorkflowPhase.rawStreamingUpload &&
+        !hasCachedCalibration) {
+      return const PhaseTransitionPlan(
+        allowed: false,
+        blockMessage:
+            'Faz 4 için önce Faz 2 kalibrasyonunu tamamlayıp Faz 3’e geçmelisiniz.',
       );
     }
 
@@ -99,6 +116,12 @@ class WorkflowPhaseTransitionController {
         return const PhaseTransitionPlan(
           allowed: true,
           statusMessage: 'Faz 3 hazır. Canlı rectify başlatabilirsiniz.',
+        );
+      case CaptureWorkflowPhase.rawStreamingUpload:
+        return const PhaseTransitionPlan(
+          allowed: true,
+          statusMessage:
+              'Faz 4 hazır. Ham frame capture + sunucu upload başlatabilirsiniz.',
         );
     }
   }
