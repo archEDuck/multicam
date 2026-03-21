@@ -54,6 +54,7 @@ class StereoPreprocessManager(private val context: Context) {
         private const val MODEL_COPY_BUFFER_BYTES = 64 * 1024
         private const val MAX_DEPTH_INPUT_PIXELS = 1920 * 1080
         private const val MAX_DEPTH_OUTPUT_PIXELS = 1920 * 1080
+        private const val RECTIFY_ALPHA = 1.0
     }
 
     private data class CheckerboardSpec(
@@ -685,6 +686,9 @@ class StereoPreprocessManager(private val context: Context) {
                 p1,
                 p2,
                 q,
+                0,
+                RECTIFY_ALPHA,
+                imageSize,
             )
 
             val cameraIds = readCameraIdsFromCaptureLog(sessionDir)
@@ -898,10 +902,31 @@ class StereoPreprocessManager(private val context: Context) {
         val d1 = jsonToMat(calibration.getJSONObject("d1"))
         val k2 = jsonToMat(calibration.getJSONObject("k2"))
         val d2 = jsonToMat(calibration.getJSONObject("d2"))
-        val r1 = jsonToMat(calibration.getJSONObject("r1"))
-        val r2 = jsonToMat(calibration.getJSONObject("r2"))
-        val p1 = jsonToMat(calibration.getJSONObject("p1"))
-        val p2 = jsonToMat(calibration.getJSONObject("p2"))
+        val r = jsonToMat(calibration.getJSONObject("r"))
+        val t = jsonToMat(calibration.getJSONObject("t"))
+        val r1 = Mat()
+        val r2 = Mat()
+        val p1 = Mat()
+        val p2 = Mat()
+        val q = Mat()
+
+        Calib3d.stereoRectify(
+            k1,
+            d1,
+            k2,
+            d2,
+            imageSize,
+            r,
+            t,
+            r1,
+            r2,
+            p1,
+            p2,
+            q,
+            0,
+            RECTIFY_ALPHA,
+            imageSize,
+        )
 
         val map1x = Mat()
         val map1y = Mat()
@@ -937,6 +962,9 @@ class StereoPreprocessManager(private val context: Context) {
         r2.release()
         p1.release()
         p2.release()
+        r.release()
+        t.release()
+        q.release()
 
         releaseRectifyMaps(cachedRectifyMaps)
         val fresh = RectifyMaps(

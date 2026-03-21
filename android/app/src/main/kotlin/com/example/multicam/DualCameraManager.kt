@@ -16,6 +16,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
+import android.util.Size
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.CountDownLatch
@@ -76,6 +77,8 @@ class DualCameraManager(private val context: Context) {
     // Latest frame byte buffers (written by ImageReader listener, read by captureDualFrame)
     @Volatile private var latestBytes1: ByteArray? = null
     @Volatile private var latestBytes2: ByteArray? = null
+    @Volatile private var captureWidth: Int = IMAGE_WIDTH
+    @Volatile private var captureHeight: Int = IMAGE_HEIGHT
 
     // Metadata for current session
     private var intrinsicsFx = ""
@@ -205,6 +208,31 @@ class DualCameraManager(private val context: Context) {
         }
     }
 
+    private fun getJpegSizes(cameraId: String): List<Size> {
+        return try {
+            val chars = cameraManager.getCameraCharacteristics(cameraId)
+            val configMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            configMap?.getOutputSizes(ImageFormat.JPEG)?.toList() ?: emptyList()
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun chooseBestCommonJpegSize(cameraId1: String, cameraId2: String): Size? {
+        val sizes1 = getJpegSizes(cameraId1)
+        val sizes2 = getJpegSizes(cameraId2)
+        if (sizes1.isEmpty() || sizes2.isEmpty()) return null
+
+        val sizes2Keys = sizes2.map { "${it.width}x${it.height}" }.toSet()
+        val common = sizes1.filter { sizes2Keys.contains("${it.width}x${it.height}") }
+        if (common.isEmpty()) return null
+
+        return common.maxWithOrNull(
+            compareBy<Size> { it.width.toLong() * it.height.toLong() }
+                .thenBy { it.width.toLong() },
+        )
+    }
+
     private fun getPrimaryFocalLength(cameraId: String): Float? {
         return try {
             val chars = cameraManager.getCameraCharacteristics(cameraId)
@@ -227,6 +255,17 @@ class DualCameraManager(private val context: Context) {
         }
 
         extractIntrinsicsAndDistortion(cam1Id)
+
+        val negotiatedSize = chooseBestCommonJpegSize(cam1Id, cam2Id)
+        if (negotiatedSize != null) {
+            captureWidth = negotiatedSize.width
+            captureHeight = negotiatedSize.height
+            Log.i(TAG, "Negotiated common JPEG size: ${captureWidth}x${captureHeight}")
+        } else {
+            captureWidth = IMAGE_WIDTH
+            captureHeight = IMAGE_HEIGHT
+            Log.w(TAG, "No common JPEG size found; fallback ${captureWidth}x${captureHeight}")
+        }
 
         val logicalInfo = findLogicalMultiCameraContaining(cam1Id, cam2Id)
         if (logicalInfo != null) {
@@ -308,8 +347,8 @@ class DualCameraManager(private val context: Context) {
 
         try {
             // Create ImageReaders with extra buffer for repeating request
-            reader1 = ImageReader.newInstance(IMAGE_WIDTH, IMAGE_HEIGHT, ImageFormat.JPEG, 4)
-            reader2 = ImageReader.newInstance(IMAGE_WIDTH, IMAGE_HEIGHT, ImageFormat.JPEG, 4)
+            reader1 = ImageReader.newInstance(captureWidth, captureHeight, ImageFormat.JPEG, 4)
+            reader2 = ImageReader.newInstance(captureWidth, captureHeight, ImageFormat.JPEG, 4)
 
             // Set up continuous frame listeners that buffer the latest bytes
             reader1!!.setOnImageAvailableListener({ reader ->
@@ -499,6 +538,8 @@ class DualCameraManager(private val context: Context) {
         result["cam1Id"] = physicalId1 ?: ""
         result["cam2Id"] = physicalId2 ?: ""
         result["capture_mode"] = "logical_multi_camera"
+        result["captureWidth"] = captureWidth
+        result["captureHeight"] = captureHeight
 
         return result
     }
@@ -610,6 +651,8 @@ class DualCameraManager(private val context: Context) {
             reader2 = null
             latestBytes1 = null
             latestBytes2 = null
+            captureWidth = IMAGE_WIDTH
+            captureHeight = IMAGE_HEIGHT
             isOpen = false
             captureMode = null
             stopBackgroundThread()

@@ -123,8 +123,8 @@ class CheckerboardOverlayPainter extends CustomPainter {
 
     final pointPaint = Paint()
       ..color = checkerFound
-          ? Colors.lightGreenAccent.withOpacity(0.95)
-          : Colors.orangeAccent.withOpacity(0.95)
+          ? Colors.lightGreenAccent.withValues(alpha: 0.95)
+          : Colors.orangeAccent.withValues(alpha: 0.95)
       ..style = PaintingStyle.fill;
 
     for (final corner in checkerCorners) {
