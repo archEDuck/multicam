@@ -384,67 +384,6 @@ class StereoMatchingPhasePanel extends StatelessWidget {
   }
 }
 
-class DepthMapPhasePanel extends StatelessWidget {
-  const DepthMapPhasePanel({
-    super.key,
-    required this.isStereoProcessing,
-    required this.showDepthPreview,
-    required this.onToggleLiveDepth,
-    required this.onBackToPhaseOne,
-  });
-
-  final bool isStereoProcessing;
-  final bool showDepthPreview;
-  final VoidCallback onToggleLiveDepth;
-  final VoidCallback onBackToPhaseOne;
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const Text(
-          'AI stereo modeli ile canlı derinlik haritası üretilir.',
-          style: TextStyle(color: Colors.white70),
-        ),
-        const SizedBox(height: 6),
-        const Text(
-          'Canlı derinlik her uygun preview karesinde çalışır.',
-          style: TextStyle(color: Colors.white54, fontSize: 12),
-        ),
-        const SizedBox(height: 4),
-        const Text(
-          'Giriş modelin beklediği boyutta verilir, çıkış model çözünürlüğünde alınır.',
-          style: TextStyle(color: Colors.white54, fontSize: 12),
-        ),
-        const SizedBox(height: 8),
-        Row(
-          children: [
-            Expanded(
-              child: FilledButton.icon(
-                onPressed: isStereoProcessing ? null : onToggleLiveDepth,
-                icon: Icon(
-                  showDepthPreview ? Icons.pause_circle_outline : Icons.blur_on,
-                ),
-                label: Text(
-                  showDepthPreview
-                      ? 'Canlı Derinlik Durdur'
-                      : 'Canlı Derinlik Başlat',
-                ),
-              ),
-            ),
-            const SizedBox(width: 8),
-            OutlinedButton(
-              onPressed: isStereoProcessing ? null : onBackToPhaseOne,
-              child: const Text('Faz 1'),
-            ),
-          ],
-        ),
-      ],
-    );
-  }
-}
-
 class _CameraSelectorField extends StatelessWidget {
   const _CameraSelectorField({
     required this.label,

@@ -54,8 +54,7 @@ class WorkflowPhaseTransitionController {
       );
     }
 
-    if ((nextPhase == CaptureWorkflowPhase.stereoMatching ||
-            nextPhase == CaptureWorkflowPhase.depthMap) &&
+    if (nextPhase == CaptureWorkflowPhase.stereoMatching &&
         !hasCachedCalibration) {
       return const PhaseTransitionPlan(
         allowed: false,
@@ -100,12 +99,6 @@ class WorkflowPhaseTransitionController {
         return const PhaseTransitionPlan(
           allowed: true,
           statusMessage: 'Faz 3 hazır. Canlı rectify başlatabilirsiniz.',
-        );
-      case CaptureWorkflowPhase.depthMap:
-        return const PhaseTransitionPlan(
-          allowed: true,
-          statusMessage:
-              'Faz 4 hazır. Canlı derinlik haritası için başlat butonunu kullanın.',
         );
     }
   }

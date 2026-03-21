@@ -227,25 +227,6 @@ private class StereoPreprocessHandler(
 				}
 			}
 
-			"depthFramePair" -> {
-				val cam1Bytes = call.argument<ByteArray>("cam1Bytes")
-				val cam2Bytes = call.argument<ByteArray>("cam2Bytes")
-				if (cam1Bytes == null || cam2Bytes == null || cam1Bytes.isEmpty() || cam2Bytes.isEmpty()) {
-					result.error("INVALID_ARGS", "cam1Bytes and cam2Bytes are required", null)
-					return
-				}
-				runOnBackground(result) {
-					manager.depthFramePair(cam1Bytes, cam2Bytes)
-				}
-			}
-
-			"releaseDepthModel" -> {
-				val reason = call.argument<String>("reason") ?: "manual"
-				runOnBackground(result) {
-					manager.releaseDepthModelRuntime(reason)
-				}
-			}
-
 			else -> result.notImplemented()
 		}
 	}

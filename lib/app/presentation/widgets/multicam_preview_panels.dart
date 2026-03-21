@@ -106,59 +106,6 @@ class CameraPreviewPanel extends StatelessWidget {
   }
 }
 
-class DepthPreviewPanel extends StatelessWidget {
-  const DepthPreviewPanel({super.key, required this.depthBytes});
-
-  final Uint8List? depthBytes;
-
-  @override
-  Widget build(BuildContext context) {
-    final hasDepth = depthBytes != null && depthBytes!.isNotEmpty;
-
-    return Container(
-      color: Colors.black,
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          if (hasDepth)
-            Image.memory(
-              depthBytes!,
-              fit: BoxFit.contain,
-              gaplessPlayback: true,
-              filterQuality: FilterQuality.low,
-            )
-          else
-            Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: const [
-                  Icon(Icons.blur_on, color: Colors.white38, size: 42),
-                  SizedBox(height: 8),
-                  Text(
-                    'Canlı derinlik haritası bekleniyor...',
-                    style: TextStyle(color: Colors.white54),
-                  ),
-                ],
-              ),
-            ),
-          Positioned(
-            top: 8,
-            left: 8,
-            child: Container(
-              color: Colors.black54,
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-              child: const Text(
-                'Derinlik Haritası',
-                style: TextStyle(color: Colors.white, fontSize: 14),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
 class CheckerboardOverlayPainter extends CustomPainter {
   const CheckerboardOverlayPainter({
     required this.checkerCorners,

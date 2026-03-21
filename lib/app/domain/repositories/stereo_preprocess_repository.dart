@@ -12,13 +12,6 @@ abstract interface class StereoPreprocessRepository {
     Uint8List cam2Bytes,
   );
 
-  Future<StereoPreprocessResult> depthFramePair(
-    Uint8List cam1Bytes,
-    Uint8List cam2Bytes,
-  );
-
-  Future<StereoPreprocessResult> releaseDepthModel({String reason = 'manual'});
-
   Future<StereoPreprocessResult> getCalibrationStatus();
 
   Future<StereoPreprocessResult> checkCheckerboard(

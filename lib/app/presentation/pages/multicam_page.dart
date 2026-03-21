@@ -8,13 +8,11 @@ import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 
-import '../../application/usecases/build_depth_map_frame_pair_use_case.dart';
 import '../../application/usecases/calibrate_stereo_session_use_case.dart';
 import '../../application/usecases/check_checkerboard_frame_pair_use_case.dart';
 import '../../application/usecases/get_calibration_status_use_case.dart';
 import '../../application/usecases/get_system_stats_use_case.dart';
 import '../../application/usecases/load_app_settings_use_case.dart';
-import '../../application/usecases/release_depth_model_use_case.dart';
 import '../../application/usecases/rectify_preview_frame_pair_use_case.dart';
 import '../../application/usecases/save_app_settings_use_case.dart';
 import '../../application/usecases/warm_up_system_stats_use_case.dart';
@@ -60,8 +58,6 @@ class _MultiCamPageState extends State<MultiCamPage> {
   late final GetCalibrationStatusUseCase _getCalibrationStatusUseCase;
   late final CalibrateStereoSessionUseCase _calibrateStereoSessionUseCase;
   late final RectifyPreviewFramePairUseCase _rectifyPreviewFramePairUseCase;
-  late final BuildDepthMapFramePairUseCase _buildDepthMapFramePairUseCase;
-  late final ReleaseDepthModelUseCase _releaseDepthModelUseCase;
   late final CheckCheckerboardFramePairUseCase
   _checkCheckerboardFramePairUseCase;
 
@@ -83,12 +79,10 @@ class _MultiCamPageState extends State<MultiCamPage> {
   bool _isGuidedCalibrationPairCapturing = false;
   bool _isCalibrationCaptureRunning = false;
   bool _isLiveRectifyProcessing = false;
-  bool _isLiveDepthProcessing = false;
 
   String _status = 'Başlatılıyor...';
   String _camera2Status = 'Camera2 raporu hazırlanıyor...';
   String _stereoStatus = '';
-  String _depthDebugStatus = '';
   String _checkerboardStatus =
       'Dama tahtası kontrolü bekleniyor. Faz 2’de otomatik aranır.';
 
@@ -96,8 +90,6 @@ class _MultiCamPageState extends State<MultiCamPage> {
   int _requiredCalibrationPairs = _defaultRequiredCalibrationPairs;
   DateTime? _lastCalibrationCaptureAt;
   DateTime? _lastLiveRectifyAt;
-  DateTime? _lastPreviewPairAt;
-  DateTime? _lastDepthFrameAt;
 
   double? _fotCm;
   int _frameIndex = 0;
@@ -120,9 +112,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
   Uint8List? _lastCam2PreviewBytes;
   Uint8List? _rectifiedCam1PreviewBytes;
   Uint8List? _rectifiedCam2PreviewBytes;
-  Uint8List? _depthPreviewBytes;
   bool _showRectifiedPreview = false;
-  bool _showDepthPreview = false;
   File? _lastCam1Frame;
   File? _lastCam2Frame;
   Directory? _previewCacheDir;
@@ -176,10 +166,6 @@ class _MultiCamPageState extends State<MultiCamPage> {
     _rectifyPreviewFramePairUseCase = RectifyPreviewFramePairUseCase(
       stereoRepository,
     );
-    _buildDepthMapFramePairUseCase = BuildDepthMapFramePairUseCase(
-      stereoRepository,
-    );
-    _releaseDepthModelUseCase = ReleaseDepthModelUseCase(stereoRepository);
     _checkCheckerboardFramePairUseCase = CheckCheckerboardFramePairUseCase(
       stereoRepository,
     );
@@ -429,9 +415,7 @@ class _MultiCamPageState extends State<MultiCamPage> {
       _lastCam2PreviewBytes = null;
       _rectifiedCam1PreviewBytes = null;
       _rectifiedCam2PreviewBytes = null;
-      _depthPreviewBytes = null;
       _showRectifiedPreview = false;
-      _showDepthPreview = false;
       _lastCam1Frame = null;
       _lastCam2Frame = null;
       _status = 'Kameralar açılıyor ($cam1, $cam2)...';
@@ -736,23 +720,6 @@ class _MultiCamPageState extends State<MultiCamPage> {
       final cam1HasData = cam1Bytes is Uint8List && cam1Bytes.isNotEmpty;
       final cam2HasData = cam2Bytes is Uint8List && cam2Bytes.isNotEmpty;
 
-      if (cam1HasData && cam2HasData) {
-        _lastPreviewPairAt = DateTime.now();
-      }
-
-      if (_phase == CaptureWorkflowPhase.depthMap &&
-          _showDepthPreview &&
-          (!cam1HasData || !cam2HasData)) {
-        setState(() {
-          _stereoStatus =
-              '✗ Canlı derinlik için güncel preview akışı eksik (cam1: ${cam1HasData ? 'ok' : 'yok'}, cam2: ${cam2HasData ? 'ok' : 'yok'}).';
-          _depthDebugStatus = _depthRuntimeSnapshot(
-            note:
-                'Preview pair eksik. getLatestPreviewFrames her iki kameradan da veri döndürmedi.',
-          );
-        });
-      }
-
       if (!cam1HasData && !cam2HasData) {
         return;
       }
@@ -780,29 +747,8 @@ class _MultiCamPageState extends State<MultiCamPage> {
         );
       }
 
-      if (_phase == CaptureWorkflowPhase.depthMap &&
-          _showDepthPreview &&
-          cam1Bytes is Uint8List &&
-          cam2Bytes is Uint8List &&
-          cam1Bytes.isNotEmpty &&
-          cam2Bytes.isNotEmpty) {
-        unawaited(
-          _refreshLiveDepthFromPreview(
-            cam1Bytes: cam1Bytes,
-            cam2Bytes: cam2Bytes,
-          ),
-        );
-      }
     } catch (error) {
       if (!mounted) return;
-      if (_phase == CaptureWorkflowPhase.depthMap && _showDepthPreview) {
-        setState(() {
-          _stereoStatus = '✗ Preview akışı hatası oluştu.';
-          _depthDebugStatus = _depthRuntimeSnapshot(
-            note: 'Preview exception: $error',
-          );
-        });
-      }
     } finally {
       _isPreviewCapturing = false;
     }
@@ -1151,11 +1097,6 @@ class _MultiCamPageState extends State<MultiCamPage> {
         _rectifiedCam1PreviewBytes = null;
         _rectifiedCam2PreviewBytes = null;
       }
-      if (nextPhase != CaptureWorkflowPhase.depthMap) {
-        _showDepthPreview = false;
-        _depthPreviewBytes = null;
-        _depthDebugStatus = '';
-      }
       if (nextPhase == CaptureWorkflowPhase.calibration) {
         _isCalibrationCaptureRunning = false;
         _capturedCalibrationPairs = 0;
@@ -1166,9 +1107,6 @@ class _MultiCamPageState extends State<MultiCamPage> {
         _checkerboardStatus =
             'Hazır. Kayda başlamak için "Çekimi Başlat" butonuna basın (0/$_requiredCalibrationPairs).';
         _status = 'Faz 2 hazır.';
-      } else if (nextPhase == CaptureWorkflowPhase.depthMap) {
-        _status =
-            'Faz 4 hazır. Canlı derinlik haritası için "Canlı Derinlik Başlat" butonuna basın.';
       } else {
         _isCalibrationCaptureRunning = false;
         _cam1CheckerboardCorners = const [];
@@ -1361,243 +1299,6 @@ class _MultiCamPageState extends State<MultiCamPage> {
     }
   }
 
-  Future<void> _runDepthMapOnDevice() async {
-    if (_isStereoProcessing || _isLiveDepthProcessing) return;
-
-    if (_showDepthPreview) {
-      if (!mounted) return;
-      setState(() {
-        _showDepthPreview = false;
-        _depthPreviewBytes = null;
-        _stereoStatus = 'Canlı derinlik durduruldu. Model kapatılıyor...';
-      });
-
-      final releaseResult = await _releaseDepthModelUseCase(
-        reason: 'user_stop_live_depth',
-      );
-      if (!mounted) return;
-      setState(() {
-        final releaseMessage = releaseResult.message.trim().isNotEmpty
-            ? releaseResult.message.trim()
-            : 'Depth model kapatıldı.';
-        _stereoStatus = releaseResult.success
-            ? '✓ $releaseMessage'
-            : '✗ $releaseMessage';
-        _depthDebugStatus = _formatDepthDebugDetails(releaseResult);
-      });
-      return;
-    }
-
-    Uint8List? cam1Bytes = _lastCam1PreviewBytes;
-    Uint8List? cam2Bytes = _lastCam2PreviewBytes;
-
-    final hasInitialFrames =
-        cam1Bytes != null &&
-        cam2Bytes != null &&
-        cam1Bytes.isNotEmpty &&
-        cam2Bytes.isNotEmpty;
-
-    if (!hasInitialFrames && _isReady && !_isRecording) {
-      await _capturePreviewFrame();
-      cam1Bytes = _lastCam1PreviewBytes;
-      cam2Bytes = _lastCam2PreviewBytes;
-    }
-
-    final canStartLiveDepth =
-        cam1Bytes != null &&
-        cam2Bytes != null &&
-        cam1Bytes.isNotEmpty &&
-        cam2Bytes.isNotEmpty;
-    if (!canStartLiveDepth) {
-      if (!mounted) return;
-      setState(() {
-        _stereoStatus =
-            'Canlı derinlik için iki kameradan güncel preview karesi gerekli.';
-      });
-      return;
-    }
-
-    if (!mounted) return;
-    setState(() {
-      _isStereoProcessing = true;
-      _stereoStatus = '';
-      _depthDebugStatus = '';
-    });
-
-    final result = await _buildDepthMapFramePairUseCase(cam1Bytes, cam2Bytes);
-    final depthBytes = _extractDepthPreview(result);
-    final hasDepthPreview =
-        depthBytes != null && depthBytes.isNotEmpty && result.success;
-    final missingDepthOutput =
-        result.success && (depthBytes == null || depthBytes.isEmpty);
-
-    if (!mounted) return;
-    setState(() {
-      _isStereoProcessing = false;
-      _showDepthPreview = hasDepthPreview;
-      _depthPreviewBytes = hasDepthPreview ? depthBytes : null;
-      _stereoStatus = hasDepthPreview
-          ? (result.message.trim().isNotEmpty
-                ? '✓ ${result.message}'
-                : '✓ AI derinlik aktif.')
-          : (missingDepthOutput
-                ? '✗ Model çalıştı ama derinlik görüntüsü üretmedi.'
-                : '✗ ${result.message}');
-      if (hasDepthPreview) {
-        _lastDepthFrameAt = DateTime.now();
-      }
-      _depthDebugStatus = _formatDepthDebugDetails(
-        result,
-        note: missingDepthOutput
-            ? 'Inference başarılı görünüyor ancak depthBytes boş geldi.'
-            : null,
-      );
-    });
-  }
-
-  Future<void> _refreshLiveDepthFromPreview({
-    required Uint8List cam1Bytes,
-    required Uint8List cam2Bytes,
-  }) async {
-    if (_phase != CaptureWorkflowPhase.depthMap || !_showDepthPreview) {
-      return;
-    }
-    if (_isStereoProcessing || _isLiveDepthProcessing) {
-      return;
-    }
-
-    _isLiveDepthProcessing = true;
-    try {
-      final result = await _buildDepthMapFramePairUseCase(cam1Bytes, cam2Bytes);
-      if (!mounted) return;
-
-      if (!result.success) {
-        setState(() {
-          _stereoStatus = '✗ ${result.message}';
-          _depthDebugStatus = _formatDepthDebugDetails(result);
-        });
-        return;
-      }
-
-      final depthBytes = _extractDepthPreview(result);
-      if (depthBytes == null || depthBytes.isEmpty) {
-        setState(() {
-          _stereoStatus = '✗ Canlı derinlik çıktısı boş geldi.';
-          _depthDebugStatus = _formatDepthDebugDetails(
-            result,
-            note: 'Periyodik inference çıktısı boş (depthBytes null/empty).',
-          );
-        });
-        return;
-      }
-
-      setState(() {
-        _depthPreviewBytes = depthBytes;
-        _lastDepthFrameAt = DateTime.now();
-        _depthDebugStatus = _formatDepthDebugDetails(result);
-      });
-    } finally {
-      _isLiveDepthProcessing = false;
-    }
-  }
-
-  String _formatDepthDebugDetails(
-    StereoPreprocessResult result, {
-    String? note,
-  }) {
-    final extras = result.extras;
-    final stage = extras['stage']?.toString().trim();
-    final backend = extras['backend']?.toString().trim();
-    final errorType = extras['errorType']?.toString().trim();
-    final modelPath = extras['modelPath']?.toString().trim();
-    final inputW = extras['modelInputWidth']?.toString().trim();
-    final inputH = extras['modelInputHeight']?.toString().trim();
-    final outputName = extras['modelOutputName']?.toString().trim();
-    final outputW = extras['modelOutputWidth']?.toString().trim();
-    final outputH = extras['modelOutputHeight']?.toString().trim();
-    final depthBytesSize = extras['depthBytesSize']?.toString().trim();
-    final inferenceMs = extras['inferenceMs']?.toString().trim();
-    final totalMs = extras['totalMs']?.toString().trim();
-
-    final lines = <String>[];
-    if (note != null && note.trim().isNotEmpty) {
-      lines.add('Note: ${note.trim()}');
-    }
-    if (stage != null && stage.isNotEmpty) {
-      lines.add('Stage: $stage');
-    }
-    if (backend != null && backend.isNotEmpty) {
-      lines.add('Backend: $backend');
-    }
-    if (errorType != null && errorType.isNotEmpty) {
-      lines.add('Error: $errorType');
-    }
-    if (inputW != null &&
-        inputW.isNotEmpty &&
-        inputH != null &&
-        inputH.isNotEmpty) {
-      lines.add('Input: ${inputW}x$inputH');
-    }
-    if (outputName != null && outputName.isNotEmpty) {
-      if (outputW != null &&
-          outputW.isNotEmpty &&
-          outputH != null &&
-          outputH.isNotEmpty) {
-        lines.add('Output: $outputName (${outputW}x$outputH)');
-      } else {
-        lines.add('Output: $outputName');
-      }
-    }
-    if (modelPath != null && modelPath.isNotEmpty) {
-      lines.add('Model: $modelPath');
-    }
-    if (depthBytesSize != null && depthBytesSize.isNotEmpty) {
-      lines.add('DepthBytes: $depthBytesSize');
-    }
-    if (inferenceMs != null && inferenceMs.isNotEmpty) {
-      lines.add('InferenceMs: $inferenceMs');
-    }
-    if (totalMs != null && totalMs.isNotEmpty) {
-      lines.add('TotalMs: $totalMs');
-    }
-
-    final runtimeSnapshot = _depthRuntimeSnapshot();
-    if (runtimeSnapshot.isNotEmpty) {
-      lines.add(runtimeSnapshot);
-    }
-
-    return lines.join('\n');
-  }
-
-  String _depthRuntimeSnapshot({String? note}) {
-    final lines = <String>[];
-    if (note != null && note.trim().isNotEmpty) {
-      lines.add('RuntimeNote: ${note.trim()}');
-    }
-
-    lines.add(
-      'LiveDepth: show=$_showDepthPreview, stereoBusy=$_isStereoProcessing, liveBusy=$_isLiveDepthProcessing',
-    );
-    lines.add(
-      'PreviewBytes: cam1=${_lastCam1PreviewBytes?.length ?? 0}, cam2=${_lastCam2PreviewBytes?.length ?? 0}',
-    );
-    lines.add('DepthUiBytes: ${_depthPreviewBytes?.length ?? 0}');
-
-    final now = DateTime.now();
-    if (_lastPreviewPairAt != null) {
-      lines.add('LastPreviewAgeMs: ${now.difference(_lastPreviewPairAt!).inMilliseconds}');
-    }
-    if (_lastDepthFrameAt != null) {
-      lines.add('LastDepthFrameAgeMs: ${now.difference(_lastDepthFrameAt!).inMilliseconds}');
-    }
-
-    return lines.join('\n');
-  }
-
-  Uint8List? _extractDepthPreview(StereoPreprocessResult result) {
-    return _asUint8List(result.extras['depthBytes']);
-  }
-
   (Uint8List?, Uint8List?) _extractRectifiedPreviewPair(
     StereoPreprocessResult result,
   ) {
@@ -1675,7 +1376,6 @@ class _MultiCamPageState extends State<MultiCamPage> {
         calibrationExists ? 'rectify_' : 'calib_',
       CaptureWorkflowPhase.calibration => 'calib_',
       CaptureWorkflowPhase.stereoMatching => 'rectify_',
-      CaptureWorkflowPhase.depthMap => 'depth_',
     };
 
     final timestamp = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
@@ -1823,10 +1523,6 @@ class _MultiCamPageState extends State<MultiCamPage> {
       checkerCorners: checkerCorners,
       checkerFound: checkerFound,
     );
-  }
-
-  Widget _buildDepthPreview() {
-    return DepthPreviewPanel(depthBytes: _depthPreviewBytes);
   }
 
   Future<void> _transitionToPhase(
@@ -2055,15 +1751,6 @@ class _MultiCamPageState extends State<MultiCamPage> {
             unawaited(_transitionToPhase(CaptureWorkflowPhase.cameraSelection));
           },
         );
-      case CaptureWorkflowPhase.depthMap:
-        return DepthMapPhasePanel(
-          isStereoProcessing: _isStereoProcessing,
-          showDepthPreview: _showDepthPreview,
-          onToggleLiveDepth: _runDepthMapOnDevice,
-          onBackToPhaseOne: () {
-            unawaited(_transitionToPhase(CaptureWorkflowPhase.cameraSelection));
-          },
-        );
     }
   }
 
@@ -2130,34 +1817,32 @@ class _MultiCamPageState extends State<MultiCamPage> {
         child: Column(
           children: [
             Expanded(
-              child: _phase == CaptureWorkflowPhase.depthMap
-                  ? _buildDepthPreview()
-                  : Row(
-                      children: [
-                        if (currentViewMode == 'Çift Kamera' ||
-                            currentViewMode == 'Tek Kamera (Kam 1)')
-                          Expanded(
-                            child: _buildPreview(
-                              cam1PreviewBytes,
-                              _lastCam1Frame,
-                              'Arka Kamera 1',
-                              checkerCorners: _cam1CheckerboardCorners,
-                              checkerFound: _checkerboardFoundCam1,
-                            ),
-                          ),
-                        if (currentViewMode == 'Çift Kamera' ||
-                            currentViewMode == 'Tek Kamera (Kam 2)')
-                          Expanded(
-                            child: _buildPreview(
-                              cam2PreviewBytes,
-                              _lastCam2Frame,
-                              'Arka Kamera 2',
-                              checkerCorners: _cam2CheckerboardCorners,
-                              checkerFound: _checkerboardFoundCam2,
-                            ),
-                          ),
-                      ],
+              child: Row(
+                children: [
+                  if (currentViewMode == 'Çift Kamera' ||
+                      currentViewMode == 'Tek Kamera (Kam 1)')
+                    Expanded(
+                      child: _buildPreview(
+                        cam1PreviewBytes,
+                        _lastCam1Frame,
+                        'Arka Kamera 1',
+                        checkerCorners: _cam1CheckerboardCorners,
+                        checkerFound: _checkerboardFoundCam1,
+                      ),
                     ),
+                  if (currentViewMode == 'Çift Kamera' ||
+                      currentViewMode == 'Tek Kamera (Kam 2)')
+                    Expanded(
+                      child: _buildPreview(
+                        cam2PreviewBytes,
+                        _lastCam2Frame,
+                        'Arka Kamera 2',
+                        checkerCorners: _cam2CheckerboardCorners,
+                        checkerFound: _checkerboardFoundCam2,
+                      ),
+                    ),
+                ],
+              ),
             ),
             if (_settings.effectiveEnableStats)
               MulticamStatsBar(stats: _systemStats, actualFps: _actualFps),
@@ -2195,16 +1880,6 @@ class _MultiCamPageState extends State<MultiCamPage> {
                             _stereoStatus,
                             style: theme.textTheme.bodyMedium?.copyWith(
                               color: _statusColor(_stereoStatus, colorScheme),
-                            ),
-                          ),
-                        ],
-                        if (_depthDebugStatus.isNotEmpty) ...[
-                          const SizedBox(height: 6),
-                          SelectableText(
-                            _depthDebugStatus,
-                            style: theme.textTheme.bodySmall?.copyWith(
-                              color: colorScheme.onSurfaceVariant,
-                              fontFamily: 'monospace',
                             ),
                           ),
                         ],

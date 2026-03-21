@@ -2,7 +2,6 @@ enum CaptureWorkflowPhase {
   cameraSelection,
   calibration,
   stereoMatching,
-  depthMap,
 }
 
 extension CaptureWorkflowPhaseLabel on CaptureWorkflowPhase {
@@ -14,8 +13,6 @@ extension CaptureWorkflowPhaseLabel on CaptureWorkflowPhase {
         return 'Faz 2';
       case CaptureWorkflowPhase.stereoMatching:
         return 'Faz 3';
-      case CaptureWorkflowPhase.depthMap:
-        return 'Faz 4';
     }
   }
 
@@ -27,8 +24,6 @@ extension CaptureWorkflowPhaseLabel on CaptureWorkflowPhase {
         return 'Kalibrasyon';
       case CaptureWorkflowPhase.stereoMatching:
         return 'Stereo Eşleme';
-      case CaptureWorkflowPhase.depthMap:
-        return 'Derinlik Haritası';
     }
   }
 }

@@ -67,46 +67,6 @@ class MethodChannelStereoPreprocessRepository
   }
 
   @override
-  Future<StereoPreprocessResult> depthFramePair(
-    Uint8List cam1Bytes,
-    Uint8List cam2Bytes,
-  ) async {
-    try {
-      final dynamic raw = await _channel.invokeMethod('depthFramePair', {
-        'cam1Bytes': cam1Bytes,
-        'cam2Bytes': cam2Bytes,
-      });
-      if (raw is Map) {
-        return StereoPreprocessResult.fromMap(raw);
-      }
-      return StereoPreprocessResult.empty(
-        'Canlı derinlik sonucu okunamadı (boş yanıt).',
-      );
-    } catch (e) {
-      return StereoPreprocessResult.empty('Canlı derinlik hatası: $e');
-    }
-  }
-
-  @override
-  Future<StereoPreprocessResult> releaseDepthModel({
-    String reason = 'manual',
-  }) async {
-    try {
-      final dynamic raw = await _channel.invokeMethod('releaseDepthModel', {
-        'reason': reason,
-      });
-      if (raw is Map) {
-        return StereoPreprocessResult.fromMap(raw);
-      }
-      return StereoPreprocessResult.empty(
-        'Model kapatma sonucu okunamadı (boş yanıt).',
-      );
-    } catch (e) {
-      return StereoPreprocessResult.empty('Model kapatma hatası: $e');
-    }
-  }
-
-  @override
   Future<StereoPreprocessResult> getCalibrationStatus() async {
     try {
       final dynamic raw = await _channel.invokeMethod('getCalibrationStatus');
